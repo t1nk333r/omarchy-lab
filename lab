@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+# Omarchy lab: a disposable, redeployable Omarchy VM for testing changes before
+# they touch production.
+#
+#   ./lab doctor      check prerequisites
+#   ./lab build       build the containerized qemu runner
+#   ./lab bootstrap   unattended-install Omarchy into a fresh disk, then snapshot
+#   ./lab up|down     start/stop the VM
+#   ./lab ssh [cmd]   shell (or one command) in the guest
+#   ./lab shot [name] PNG screenshot of the guest display
+#   ./lab reset       throw the guest away and recreate it from the snapshot
+#   ./lab sync        push production configs into the guest
+#   ./lab test        run the test suite inside the guest
+#   ./lab promote <rel> [...]  copy a guest-verified config back to production
+#   ./lab status|logs|destroy
+set -euo pipefail
+
+LAB_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+IMAGES=$LAB_DIR/images
+STATE=$LAB_DIR/state
+RUN=$LAB_DIR/run
+SHOTS=$RUN/shots
+
+# shellcheck source=lab.conf
+source "$LAB_DIR/lab.conf"
+
+ISO=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso
+GOLDEN=$IMAGES/golden.qcow2
+DISK=$IMAGES/disk.qcow2
+CIDATA=$IMAGES/cidata.iso
+OVMF_VARS=$IMAGES/OVMF_VARS.fd
+KEY=$STATE/id_ed25519
+KNOWN=$STATE/known_hosts
+PASSFILE=$STATE/vm_password
+
+die() { printf '\033[31merror\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ok()  { printf '\033[32m ok\033[0m %s\n' "$*"; }
+
+# --- runner plumbing --------------------------------------------------------
+
+# Containers run as the invoking user so every artifact in images/ and run/
+# stays host-writable; /dev/kvm is mode 0666 here, so no extra groups needed.
+LAB_UID_ARGS=(--user "$(id -u):$(id -g)")
+
+# One-shot container for image work (qemu-img, genisoimage). No KVM needed.
+runner_once() {
+  docker run --rm "${LAB_UID_ARGS[@]}" \
+    -v "$IMAGES:/images" -v "$STATE:/state" \
+    "$LAB_RUNNER_IMAGE" "$*"
+}
+
+vm_running() { [[ $(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER" 2>/dev/null) == true ]]; }
+
+qmp() { # qmp <json-command>
+  vm_running || die "VM is not running"
+  docker exec -i "$LAB_CONTAINER" python -c '
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect("/labrun/qmp.sock")
+f = s.makefile("rw")
+f.readline()
+for cmd in ["{\"execute\":\"qmp_capabilities\"}", sys.argv[1]]:
+    f.write(cmd + "\n"); f.flush()
+    print(f.readline().strip())
+' "$1"
+}
+
+# --- prerequisites ----------------------------------------------------------
+
+cmd_doctor() {
+  local fail=0
+  [[ -c /dev/kvm && -w /dev/kvm ]] && ok "/dev/kvm writable" || { echo "missing /dev/kvm"; fail=1; }
+  docker info >/dev/null 2>&1 && ok "docker reachable" || { echo "docker unreachable"; fail=1; }
+  docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 \
+    && ok "runner image $LAB_RUNNER_IMAGE" || echo "runner image missing - run: ./lab build"
+  if [[ -f $ISO ]]; then
+    ok "iso present ($(du -h "$ISO" | cut -f1))"
+  else
+    echo "iso missing - run: ./lab fetch-iso"
+  fi
+  [[ -f $GOLDEN ]] && ok "golden snapshot present" || echo "no golden snapshot - run: ./lab bootstrap"
+  vm_running && ok "VM running" || echo "VM stopped"
+  return $fail
+}
+
+cmd_build() {
+  say "building $LAB_RUNNER_IMAGE"
+  docker build -q -t "$LAB_RUNNER_IMAGE" "$LAB_DIR/runner"
+  ok "runner built"
+}
+
+cmd_fetch_iso() {
+  mkdir -p "$IMAGES"
+  [[ -f $ISO ]] || { say "downloading $LAB_ISO_URL"; curl -fL --retry 3 -C - -o "$ISO" "$LAB_ISO_URL"; }
+  say "verifying checksum"
+  local sums=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso.sha256
+  [[ -f $sums ]] || curl -fsSL -o "$sums" "$LAB_ISO_URL.sha256"
+  (cd "$IMAGES" && sha256sum -c "$(basename "$sums")") || die "ISO checksum mismatch"
+  ok "iso verified"
+}
+
+# --- cidata (unattended answer drive) ---------------------------------------
+
+# Builds the drive the Omarchy ISO looks for: label cidata, carrying exactly the
+# files the interactive configurator would have written.
+# Contract: omacom/omarchy manual/51-unattended-installs.md
+cmd_cidata() {
+  mkdir -p "$STATE/cidata" "$IMAGES"
+  chmod 700 "$STATE"
+
+  [[ -f $KEY ]] || { say "generating lab ssh key"; ssh-keygen -q -t ed25519 -N '' -C "omarchy-lab" -f "$KEY"; }
+  if [[ ! -f $PASSFILE ]]; then
+    say "generating guest password"
+    (umask 077; openssl rand -base64 18 > "$PASSFILE")
+  fi
+
+  local tz=$LAB_TIMEZONE
+  [[ -n $tz ]] || tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)
+
+  local hash
+  hash=$(openssl passwd -6 "$(cat "$PASSFILE")")
+
+  # Partition math copied from the ISO configurator so the layout matches a
+  # normal install byte for byte (1MiB gap, 2GiB ESP, btrfs remainder).
+  local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024)) bytes
+  case $LAB_DISK_SIZE in
+    *G) bytes=$(( ${LAB_DISK_SIZE%G} * gib )) ;;
+    *M) bytes=$(( ${LAB_DISK_SIZE%M} * mib )) ;;
+    *)  bytes=$LAB_DISK_SIZE ;;
+  esac
+  local disk_size_in_mib=$(( bytes / mib * mib ))
+  local boot_start=$mib boot_size=$(( 2 * gib ))
+  local main_start=$(( boot_size + boot_start ))
+  local main_size=$(( disk_size_in_mib - main_start - mib ))
+
+  cp "$KEY.pub" "$STATE/cidata/authorized_keys"
+
+  cat > "$STATE/cidata/user_credentials.json" <<JSON
+{
+    "root_enc_password": "$hash",
+    "users": [
+        {
+            "enc_password": "$hash",
+            "groups": [],
+            "sudo": true,
+            "username": "$LAB_USER"
+        }
+    ]
+}
+JSON
+
+  cat > "$STATE/cidata/user_configuration.json" <<JSON
+{
+    "app_config": null,
+    "archinstall-language": "English",
+    "auth_config": {},
+    "audio_config": { "audio": "pipewire" },
+    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
+    "custom_commands": [],
+    "omarchy_install": {
+        "mode": "full_disk",
+        "defer_provisioning": false,
+        "target_mount": "/mnt",
+        "boot": {
+            "esp_mount": "/boot",
+            "esp_path": "/EFI/limine",
+            "efi_binary": "limine_x64.efi",
+            "enable_fallback": true
+        },
+        "storage": {
+            "kernel": "linux"
+        }
+    },
+    "disk_config": {
+        "config_type": "default_layout",
+        "device_modifications": [
+            {
+                "device": "/dev/vda",
+                "partitions": [
+                    {
+                        "btrfs": [],
+                        "dev_path": null,
+                        "flags": [ "boot", "esp" ],
+                        "fs_type": "fat32",
+                        "mount_options": [],
+                        "mountpoint": "/boot",
+                        "obj_id": "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d",
+                        "size": {
+                            "sector_size": { "unit": "B", "value": 512 },
+                            "unit": "B",
+                            "value": $boot_size
+                        },
+                        "start": {
+                            "sector_size": { "unit": "B", "value": 512 },
+                            "unit": "B",
+                            "value": $boot_start
+                        },
+                        "status": "create",
+                        "type": "primary"
+                    },
+                    {
+                        "btrfs": [
+                            { "mountpoint": "/", "name": "@" },
+                            { "mountpoint": "/home", "name": "@home" },
+                            { "mountpoint": "/var/log", "name": "@log" },
+                            { "mountpoint": "/var/cache/pacman/pkg", "name": "@pkg" }
+                        ],
+                        "dev_path": null,
+                        "flags": [],
+                        "fs_type": "btrfs",
+                        "mount_options": [ "compress=zstd" ],
+                        "mountpoint": null,
+                        "obj_id": "8c2c2b92-1070-455d-b76a-56263bab24aa",
+                        "size": {
+                            "sector_size": { "unit": "B", "value": 512 },
+                            "unit": "B",
+                            "value": $main_size
+                        },
+                        "start": {
+                            "sector_size": { "unit": "B", "value": 512 },
+                            "unit": "B",
+                            "value": $main_start
+                        },
+                        "status": "create",
+                        "type": "primary"
+                    }
+                ],
+                "wipe": true
+            }
+        ]
+    },
+    "hostname": "$LAB_HOSTNAME",
+    "kernels": [ "linux" ],
+    "network_config": { "type": "iso" },
+    "ntp": true,
+    "parallel_downloads": 8,
+    "script": null,
+    "services": [],
+    "swap": true,
+    "timezone": "$tz",
+    "locale_config": {
+        "kb_layout": "$LAB_KEYBOARD",
+        "sys_enc": "UTF-8",
+        "sys_lang": "en_US.UTF-8"
+    },
+    "mirror_config": {
+        "custom_repositories": [],
+        "custom_servers": [
+            {"url": "https://mirror.omarchy.org/\$repo/os/\$arch"},
+            {"url": "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"},
+            {"url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"}
+        ],
+        "mirror_regions": {},
+        "optional_repositories": []
+    },
+    "packages": [
+        "base-devel",
+        "git",
+        "omarchy-keyring",
+        "omarchy-settings",
+        "omarchy"
+    ],
+    "profile_config": {
+        "gfx_driver": null,
+        "greeter": null,
+        "profile": {}
+    },
+    "version": "3.0.9"
+}
+JSON
+
+  jq -e . "$STATE/cidata/user_configuration.json" >/dev/null || die "generated user_configuration.json is not valid JSON"
+  jq -e . "$STATE/cidata/user_credentials.json" >/dev/null || die "generated user_credentials.json is not valid JSON"
+
+  runner_once "genisoimage -quiet -output /images/cidata.iso -volid cidata -joliet -rock /state/cidata"
+  ok "cidata.iso built (user=$LAB_USER host=$LAB_HOSTNAME tz=$tz)"
+}
+
+# --- VM lifecycle -----------------------------------------------------------
+
+qemu_argv() { # qemu_argv <install|run>
+  local mode=$1
+  local -a a=(
+    qemu-system-x86_64
+    -name "$LAB_HOSTNAME"
+    -machine q35,accel=kvm -cpu host -smp "$LAB_CPUS" -m "$LAB_MEMORY"
+    -drive "if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+    -drive "if=pflash,format=raw,file=/images/OVMF_VARS.fd"
+    -drive "if=none,id=hd0,file=/images/disk.qcow2,format=qcow2,cache=writeback,discard=unmap"
+    -device virtio-blk-pci,drive=hd0,bootindex=0
+    -netdev "user,id=net0,hostfwd=tcp:0.0.0.0:$LAB_SSH_PORT-:22"
+    -device virtio-net-pci,netdev=net0
+    -device virtio-vga -device virtio-rng-pci -device virtio-tablet-pci -device virtio-keyboard-pci
+    -display none -vnc "0.0.0.0:0"
+    -qmp "unix:/labrun/qmp.sock,server=on,wait=off"
+    -serial "file:/labrun/serial.log"
+  )
+  if [[ $mode == install ]]; then
+    a+=(
+      # q35's AHCI gives one unit per port, so each cdrom needs its own bus.
+      -drive "if=none,id=cd0,file=/images/$(basename "$ISO"),format=raw,media=cdrom"
+      -device ide-cd,drive=cd0,bus=ide.0,bootindex=1
+      -drive "if=none,id=cd1,file=/images/cidata.iso,format=raw,media=cdrom"
+      -device ide-cd,drive=cd1,bus=ide.1
+    )
+  fi
+  printf '%q ' "${a[@]}"
+}
+
+start_vm() { # start_vm <install|run>
+  local mode=$1
+  vm_running && die "VM already running (./lab down first)"
+  docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
+  mkdir -p "$RUN" "$SHOTS"
+  : > "$RUN/serial.log"
+  [[ -f $OVMF_VARS ]] || runner_once "cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /images/OVMF_VARS.fd"
+  say "starting VM ($mode)"
+  docker run -d --name "$LAB_CONTAINER" "${LAB_UID_ARGS[@]}" \
+    --device /dev/kvm \
+    -p "127.0.0.1:$LAB_SSH_PORT:$LAB_SSH_PORT" \
+    -p "127.0.0.1:$LAB_VNC_PORT:5900" \
+    -v "$IMAGES:/images" -v "$RUN:/labrun" \
+    "$LAB_RUNNER_IMAGE" "$(qemu_argv "$mode")" >/dev/null
+  sleep 2
+  vm_running || { docker logs "$LAB_CONTAINER" 2>&1 | tail -20; die "VM failed to start"; }
+  ok "VM up (ssh 127.0.0.1:$LAB_SSH_PORT, vnc 127.0.0.1:$LAB_VNC_PORT)"
+}
+
+# The guest's host key changes at every reinstall (installer env -> installed
+# system -> a later bootstrap), and it is a disposable VM reachable only on
+# 127.0.0.1, so host keys are deliberately not pinned.
+# IdentityAgent=none matters: the desktop's ssh-agent stalls ~60s per
+# connection before refusing to list identities, and the lab key is on disk.
+ssh_opts() {
+  printf '%s ' -i "$KEY" -p "$LAB_SSH_PORT" \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o IdentityAgent=none -o IdentitiesOnly=yes -o GSSAPIAuthentication=no \
+    -o ConnectTimeout=5 -o LogLevel=ERROR
+}
+
+wait_ssh() { # wait_ssh <minutes>
+  local deadline=$(( $(date +%s) + ${1:-5} * 60 )) n=0
+  say "waiting for guest sshd (up to ${1:-5}m)"
+  while (( $(date +%s) < deadline )); do
+    if ssh $(ssh_opts) -o BatchMode=yes "$LAB_USER@127.0.0.1" true 2>/dev/null; then
+      ok "guest reachable over ssh"; return 0
+    fi
+    vm_running || die "VM died during wait (see ./lab logs)"
+    sleep 10; n=$((n+1))
+    (( n % 6 )) || printf '    still waiting (%dm)\n' $((n / 6))
+  done
+  die "timed out waiting for guest sshd"
+}
+
+cmd_bootstrap() {
+  docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 || cmd_build
+  [[ -f $ISO ]] || cmd_fetch_iso
+  cmd_cidata
+  [[ -f $GOLDEN ]] && die "golden snapshot exists; use ./lab reset, or ./lab destroy first"
+  say "creating $LAB_DISK_SIZE disk"
+  rm -f "$DISK" "$OVMF_VARS"
+  runner_once "qemu-img create -f qcow2 /images/disk.qcow2 $LAB_DISK_SIZE"
+  start_vm install
+  say "unattended install running; the guest reboots itself when done"
+  wait_ssh "$LAB_INSTALL_TIMEOUT_MIN"
+  cmd_provision
+  cmd_golden
+}
+
+# Post-install guest setup: autologin so a reset guest lands in Hyprland, plus
+# the tooling the test suite needs. Idempotent.
+cmd_provision() {
+  vm_running || die "VM is not running"
+  say "provisioning guest"
+  [[ -f $PASSFILE ]] || die "missing $PASSFILE"
+  # The script reads the sudo password from stdin's first line, so it is copied
+  # in first and then fed the password — the password never becomes an argv entry.
+  cmd_ssh "cat > /tmp/postinstall.sh" < "$LAB_DIR/provision/postinstall.sh"
+  cat "$PASSFILE" | cmd_ssh "bash /tmp/postinstall.sh"
+  say "restarting display manager"
+  printf '%s\n' "$(cat "$PASSFILE")" | cmd_ssh "sudo -S -p '' systemctl restart sddm" || true
+  wait_ssh 2
+}
+
+# Seal the current guest state as the new revert point. The guest disk is either
+# a standalone image (straight after bootstrap) or an overlay on the existing
+# golden — in which case it MUST be committed into its backing file, never
+# moved over it.
+cmd_golden() {
+  say "sealing golden snapshot"
+  cmd_down
+  local backing
+  backing=$(runner_once "qemu-img info --output=json /images/disk.qcow2" | jq -r '."backing-filename" // empty')
+  if [[ -n $backing ]]; then
+    say "committing overlay into $(basename "$backing")"
+    runner_once "qemu-img commit -q /images/disk.qcow2"
+    rm -f "$DISK"
+  else
+    mv "$DISK" "$GOLDEN"
+  fi
+  runner_once "qemu-img create -q -f qcow2 -F qcow2 -b /images/golden.qcow2 /images/disk.qcow2"
+  cp "$OVMF_VARS" "$IMAGES/OVMF_VARS.golden.fd"
+  ok "golden sealed ($(du -h "$GOLDEN" | cut -f1)); ./lab reset returns here in seconds"
+  cmd_up
+}
+
+cmd_up() {
+  [[ -f $DISK ]] || die "no guest disk; run ./lab bootstrap"
+  start_vm run
+  wait_ssh 3
+}
+
+cmd_down() {
+  vm_running || { ok "already stopped"; return 0; }
+  say "shutting guest down"
+  qmp '{"execute":"system_powerdown"}' >/dev/null 2>&1 || true
+  for _ in $(seq 30); do vm_running || break; sleep 1; done
+  docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
+  ok "stopped"
+}
+
+cmd_reset() {
+  [[ -f $GOLDEN ]] || die "no golden snapshot; run ./lab bootstrap"
+  say "discarding guest state"
+  docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
+  rm -f "$DISK"
+  cp "$IMAGES/OVMF_VARS.golden.fd" "$OVMF_VARS"
+  runner_once "qemu-img create -q -f qcow2 -F qcow2 -b /images/golden.qcow2 /images/disk.qcow2"
+  ok "guest reverted to golden"
+  cmd_up
+}
+
+cmd_ssh() {
+  if (( $# )); then ssh $(ssh_opts) "$LAB_USER@127.0.0.1" "$@"
+  else ssh $(ssh_opts) -t "$LAB_USER@127.0.0.1"; fi
+}
+
+cmd_shot() {
+  local name=${1:-shot-$(date +%Y%m%d-%H%M%S)}
+  mkdir -p "$SHOTS"
+  qmp "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"/labrun/shots/$name.png\",\"format\":\"png\"}}" >/dev/null
+  ok "$SHOTS/$name.png"
+}
+
+cmd_status() {
+  printf 'container : %s\n' "$(docker inspect -f '{{.State.Status}}' "$LAB_CONTAINER" 2>/dev/null || echo absent)"
+  printf 'golden    : %s\n' "$([[ -f $GOLDEN ]] && du -h "$GOLDEN" | cut -f1 || echo none)"
+  printf 'overlay   : %s\n' "$([[ -f $DISK ]] && du -h "$DISK" | cut -f1 || echo none)"
+  printf 'ssh       : 127.0.0.1:%s (user %s)\n' "$LAB_SSH_PORT" "$LAB_USER"
+  printf 'vnc       : 127.0.0.1:%s\n' "$LAB_VNC_PORT"
+  vm_running && cmd_ssh 'printf "guest     : %s / omarchy %s / %s\n" "$(hostnamectl hostname)" "$(omarchy version 2>/dev/null || echo ?)" "$(uname -r)"' || true
+}
+
+cmd_logs() { tail -n "${1:-40}" "$RUN/serial.log" 2>/dev/null || echo "no serial log yet"; }
+
+cmd_destroy() {
+  docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
+  rm -f "$DISK" "$GOLDEN" "$OVMF_VARS" "$IMAGES/OVMF_VARS.golden.fd" "$CIDATA"
+  ok "guest disks removed (ISO and ssh key kept)"
+}
+
+# --- production <-> guest config flow ---------------------------------------
+
+# Mirror production config paths into the guest. The manifest is read into an
+# array first: ssh inside the loop would otherwise consume the rest of it from
+# stdin and only the first entry would ever sync.
+cmd_sync() {
+  vm_running || die "VM is not running"
+  local -a paths=()
+  local synced=0
+  mapfile -t paths < <(grep -vE '^\s*(#|$)' "$LAB_DIR/sync/manifest")
+  for rel in "${paths[@]}"; do
+    local src=$HOME/$rel
+    [[ -e $src ]] || { echo "  skip (absent): $rel"; continue; }
+    ssh $(ssh_opts) -n "$LAB_USER@127.0.0.1" "mkdir -p \"\$(dirname ~/$rel)\""
+    tar -C "$HOME" -cf - "$rel" | cmd_ssh "tar -C ~ -xf -"
+    echo "  synced: $rel"; synced=$((synced+1))
+  done
+  ok "$synced path(s) pushed to guest"
+}
+
+cmd_test() {
+  vm_running || die "VM is not running"
+  say "pushing test suite"
+  tar -C "$LAB_DIR" -cf - tests | cmd_ssh "rm -rf ~/lab-tests && mkdir -p ~/lab-tests && tar -C ~/lab-tests -xf -"
+  say "running tests in guest"
+  # [0-9]*.sh so tests/lib.sh (sourced infrastructure) is not run as a test.
+  cmd_ssh 'set -o pipefail; fail=0; for t in ~/lab-tests/tests/[0-9]*.sh; do
+      printf "\n--- %s\n" "$(basename "$t")"
+      bash "$t" || { fail=1; printf "FAILED: %s\n" "$(basename "$t")"; }
+    done; exit $fail'
+}
+
+# Pull a guest-verified file back to production, keeping a timestamped backup.
+cmd_promote() {
+  (( $# )) || die "usage: ./lab promote <path-relative-to-\$HOME> [...]"
+  vm_running || die "VM is not running"
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  for rel in "$@"; do
+    cmd_ssh "test -e ~/$rel" || die "guest has no ~/$rel"
+    local dst=$HOME/$rel
+    if [[ -e $dst ]]; then
+      local bak=$LAB_DIR/promote-backups/$stamp/$rel
+      mkdir -p "$(dirname "$bak")"
+      cp -a "$dst" "$bak"
+      echo "  backup: $bak"
+    fi
+    mkdir -p "$(dirname "$dst")"
+    cmd_ssh "tar -C ~ -cf - $rel" | tar -C "$HOME" -xf -
+    echo "  promoted: $rel"
+  done
+  ok "promoted $# path(s); backups under promote-backups/$stamp"
+}
+
+case ${1:-} in
+  doctor)    shift; cmd_doctor "$@" ;;
+  build)     shift; cmd_build "$@" ;;
+  fetch-iso) shift; cmd_fetch_iso "$@" ;;
+  cidata)    shift; cmd_cidata "$@" ;;
+  bootstrap) shift; cmd_bootstrap "$@" ;;
+  golden)    shift; cmd_golden "$@" ;;
+  provision) shift; cmd_provision "$@" ;;
+  up)        shift; cmd_up "$@" ;;
+  down)      shift; cmd_down "$@" ;;
+  reset)     shift; cmd_reset "$@" ;;
+  ssh)       shift; cmd_ssh "$@" ;;
+  shot)      shift; cmd_shot "$@" ;;
+  status)    shift; cmd_status "$@" ;;
+  logs)      shift; cmd_logs "$@" ;;
+  sync)      shift; cmd_sync "$@" ;;
+  test)      shift; cmd_test "$@" ;;
+  promote)   shift; cmd_promote "$@" ;;
+  destroy)   shift; cmd_destroy "$@" ;;
+  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
+esac

@@ -1,0 +1,6 @@
+# Large or sensitive lab artifacts. The lab is reproducible from lab.conf plus
+# `./lab bootstrap`, so none of this belongs in git.
+images/
+run/
+state/
+promote-backups/

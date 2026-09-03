@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# Switch the system language/locale, reversibly.
+#
+#   omarchy-lang status
+#   omarchy-lang set ar_SA.UTF-8 [--mode hybrid|full|formats]
+#   omarchy-lang reset                      # back to en_US.UTF-8, single LANG
+#   omarchy-lang keyboard [--write]         # fix the us/ara layout toggle
+#
+# Options: --dry-run  print the commands instead of running them
+#          --no-user-env  skip ~/.config/environment.d/95-lang.conf
+#
+# Modes (what lands in /etc/locale.conf):
+#   hybrid   LANG=<ar>, but LC_NUMERIC/LC_TIME/LC_COLLATE pinned to en_US.UTF-8.
+#            Arabic UI + RTL; dates, numbers and sort order stay machine
+#            parseable (ar_* locales emit Arabic-Indic digits: ٠١٢٣).
+#   full     LANG=<ar> only. Everything Arabic, digits included.
+#   formats  LANG=en_US.UTF-8 + Arabic LC_TIME/NUMERIC/MONETARY/PAPER/
+#            MEASUREMENT/ADDRESS/TELEPHONE/NAME. English UI, no RTL mirroring.
+#
+# Never sets LC_ALL: it overrides every LC_* and defeats hybrid/formats.
+set -euo pipefail
+
+DRY=0
+USER_ENV=1
+MODE=hybrid
+ENV_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/95-lang.conf
+FALLBACK=en_US.UTF-8
+KB_OPTS_BASE="compose:caps,shift:both_capslock_cancel"
+
+die() { printf '\033[31merror\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ok()  { printf '\033[32m ok\033[0m %s\n' "$*"; }
+note(){ printf '\033[33m  ! \033[0m%s\n' "$*"; }
+
+# --- privilege --------------------------------------------------------------
+
+# sudo when a terminal can answer the password prompt, non-interactive sudo when
+# it is already free. Never pkexec: this script is meant to be run from a shell.
+PRIV=()
+PRIV_RESOLVED=0
+resolve_priv() {
+  (( PRIV_RESOLVED )) && return 0
+  PRIV_RESOLVED=1
+  if (( EUID == 0 )); then PRIV=()
+  elif sudo -n true 2>/dev/null; then PRIV=(sudo)
+  elif [[ -t 0 || -t 1 ]]; then PRIV=(sudo)
+  else
+    die "no root and sudo would need a password with no terminal to ask on.
+      Run it from an interactive shell (in the lab: ./lab ssh, then ./omarchy-lang ...)."
+  fi
+}
+
+# A dry run must not need privilege at all, so the check comes before resolving.
+priv() { # priv <cmd...>
+  if (( DRY )); then printf '   would run (as root): %s\n' "$*"; return 0; fi
+  resolve_priv
+  "${PRIV[@]}" "$@"
+}
+
+# --- locale plumbing --------------------------------------------------------
+
+# `locale -a` prints normalised names (ar_SA.utf8), locale.gen carries the
+# canonical ones (ar_SA.UTF-8). Compare in one shape.
+normalise() { printf '%s' "${1,,}" | sed 's/utf-8/utf8/'; }
+
+locale_generated() { # locale_generated <name>
+  local want have
+  want=$(normalise "$1")
+  while read -r have; do
+    [[ $(normalise "$have") == "$want" ]] && return 0
+  done < <(locale -a 2>/dev/null)
+  return 1
+}
+
+locale_known() { # in /etc/locale.gen at all, commented or not
+  grep -qE "^#?${1//./\\.} " /etc/locale.gen
+}
+
+backup() { # backup <file>
+  local f=$1
+  [[ -e $f ]] || return 0
+  priv cp -a "$f" "$f.bak.$(date +%Y%m%d-%H%M%S)"
+}
+
+ensure_generated() { # ensure_generated <name>
+  local name=$1
+  if locale_generated "$name"; then ok "$name already generated"; return 0; fi
+  locale_known "$name" || die "$name is not a locale glibc ships (not in /etc/locale.gen)"
+  say "enabling $name in /etc/locale.gen"
+  backup /etc/locale.gen
+  priv sed -i -E "s/^#(${name//./\\.} .*)$/\1/" /etc/locale.gen
+  say "running locale-gen (regenerates every uncommented locale)"
+  priv locale-gen
+  if (( DRY )); then return 0; fi
+  locale_generated "$name" || die "locale-gen did not produce $name"
+  ok "$name generated"
+}
+
+# Assignment list for /etc/locale.conf. localectl replaces the whole file with
+# exactly what it is handed, so unlisted categories are cleared, not kept.
+assignments() { # assignments <ar-locale> <mode>
+  local ar=$1 mode=$2
+  case $mode in
+    hybrid)
+      printf '%s\n' "LANG=$ar" \
+        "LC_NUMERIC=$FALLBACK" "LC_TIME=$FALLBACK" "LC_COLLATE=$FALLBACK" ;;
+    full)
+      printf '%s\n' "LANG=$ar" ;;
+    formats)
+      printf '%s\n' "LANG=$FALLBACK" \
+        "LC_TIME=$ar" "LC_NUMERIC=$ar" "LC_MONETARY=$ar" "LC_PAPER=$ar" \
+        "LC_MEASUREMENT=$ar" "LC_ADDRESS=$ar" "LC_TELEPHONE=$ar" "LC_NAME=$ar" ;;
+    *) die "unknown mode: $mode (want hybrid, full or formats)" ;;
+  esac
+}
+
+write_user_env() { # write_user_env <assignment...>
+  (( USER_ENV )) || { note "skipped $ENV_FILE (--no-user-env)"; return 0; }
+  if (( DRY )); then
+    printf '   would write %s:\n' "$ENV_FILE"
+    printf '     %s\n' "$@"
+    return 0
+  fi
+  mkdir -p "$(dirname "$ENV_FILE")"
+  { echo "# Written by omarchy-lang on $(date -Is). Read by systemd --user, so"
+    echo "# it also covers the uwsm-launched Hyprland session."
+    printf '%s\n' "$@"
+  } > "$ENV_FILE"
+  ok "wrote $ENV_FILE"
+}
+
+# Push the new locale at the pieces of the running session that will take it.
+# Already-running apps keep the locale they started with; only a re-login is a
+# real switch.
+refresh_session() { # refresh_session <assignment...>
+  if (( DRY )); then printf '   would refresh systemd/dbus session env\n'; return 0; fi
+  systemctl --user set-environment "$@" 2>/dev/null \
+    && ok "systemd user environment updated" \
+    || note "no systemd user manager reachable (fine over plain ssh)"
+  command -v dbus-update-activation-environment >/dev/null \
+    && dbus-update-activation-environment --systemd "${@%%=*}" 2>/dev/null || true
+  for a in "$@"; do
+    command -v hyprctl >/dev/null && hyprctl keyword env "${a/=/,}" >/dev/null 2>&1 || true
+  done
+}
+
+sample() { # sample <assignment...> - show what actually changed
+  local -a envs=("$@")
+  echo
+  say "sample output under the new locale"
+  printf '  date  : %s\n' "$(env -u LC_ALL "${envs[@]}" date '+%A %d %B %Y %H:%M')"
+  printf '  number: %s\n' "$(env -u LC_ALL "${envs[@]}" /usr/bin/printf "%'d\n" 1234567 2>/dev/null || echo n/a)"
+  printf '  money : %s\n' "$(env -u LC_ALL "${envs[@]}" locale currency_symbol 2>/dev/null || echo n/a)"
+  printf '  paper : %s\n' "$(env -u LC_ALL "${envs[@]}" locale -k LC_PAPER 2>/dev/null | tr '\n' ' ')"
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_status() {
+  say "configured (/etc/locale.conf)"
+  if [[ -r /etc/locale.conf ]]; then sed 's/^/  /' /etc/locale.conf; else echo "  (absent)"; fi
+
+  say "user override ($ENV_FILE)"
+  if [[ -r $ENV_FILE ]]; then grep -v '^#' "$ENV_FILE" | sed 's/^/  /'; else echo "  (absent)"; fi
+
+  say "effective in this shell"
+  locale | grep -E '^(LANG|LC_ALL|LC_MESSAGES|LC_TIME|LC_NUMERIC|LC_COLLATE)=' | sed 's/^/  /'
+  [[ -n ${LC_ALL:-} ]] && note "LC_ALL=$LC_ALL is set in this environment; it overrides every LC_* above"
+
+  say "generated locales"
+  locale -a | grep -vxiE 'c|c\.utf8|posix' | sed 's/^/  /' | paste -sd' ' -
+
+  say "arabic fonts"
+  local n; n=$(fc-list :lang=ar 2>/dev/null | wc -l)
+  (( n )) && ok "$n face(s), default: $(fc-match :lang=ar family 2>/dev/null)" \
+          || note "no Arabic-capable font; install noto-fonts"
+
+  say "keyboard"
+  if command -v hyprctl >/dev/null && hyprctl devices >/dev/null 2>&1; then
+    local rules; rules=$(hyprctl devices | grep -m1 'rules:')
+    printf '  %s\n' "${rules#"${rules%%[![:space:]]*}"}"
+    grep -q 'ara' <<<"$rules" || note "no 'ara' layout loaded"
+    if grep -q 'ara' <<<"$rules" && ! grep -qE 'grp:' <<<"$rules"; then
+      note "'ara' is loaded but no grp: toggle in kb_options -> unreachable. See: omarchy-lang keyboard"
+    fi
+  else
+    printf '  hyprctl unavailable; /etc/vconsole.conf XKBLAYOUT=%s\n' \
+      "$(grep -m1 '^XKBLAYOUT=' /etc/vconsole.conf 2>/dev/null | cut -d= -f2)"
+  fi
+}
+
+cmd_set() { # cmd_set <locale>
+  local ar=${1:?usage: omarchy-lang set <locale> [--mode MODE]}
+  [[ $ar == *.UTF-8 ]] || die "use the UTF-8 form, e.g. ar_SA.UTF-8"
+  # Validated here, in the parent shell, and before anything is mutated:
+  # `die` inside the mapfile process substitution below would only kill the
+  # subshell, leaving localectl to be called with no assignments at all.
+  case $MODE in
+    hybrid|full|formats) ;;
+    *) die "unknown mode: $MODE (want hybrid, full or formats)" ;;
+  esac
+
+  ensure_generated "$ar"
+  locale_generated "$FALLBACK" || ensure_generated "$FALLBACK"
+
+  local -a envs
+  mapfile -t envs < <(assignments "$ar" "$MODE")
+  (( ${#envs[@]} )) || die "no assignments computed; refusing to rewrite /etc/locale.conf"
+
+  say "setting locale ($MODE)"
+  printf '  %s\n' "${envs[@]}"
+  backup /etc/locale.conf
+  priv localectl set-locale "${envs[@]}"
+  if (( ! DRY )); then
+    ok "/etc/locale.conf now:"; sed 's/^/    /' /etc/locale.conf
+  fi
+
+  write_user_env "${envs[@]}"
+  refresh_session "${envs[@]}"
+  (( DRY )) || sample "${envs[@]}"
+
+  echo
+  note "log out and back in: running apps keep the locale they were started with"
+  note "Omarchy's own bar/menus/OSD have no translations and stay English"
+  note "terminals (alacritty, foot, kitty, ghostty) have no bidi/Arabic shaping"
+  [[ $MODE != formats ]] && note "Firefox needs its own catalogue: omarchy pkg add firefox-i18n-ar"
+  return 0
+}
+
+cmd_reset() {
+  say "reverting to $FALLBACK"
+  backup /etc/locale.conf
+  priv localectl set-locale "LANG=$FALLBACK"
+  if (( DRY )); then
+    printf '   would remove %s\n' "$ENV_FILE"
+  else
+    rm -f "$ENV_FILE" && ok "removed $ENV_FILE"
+    ok "/etc/locale.conf now:"; sed 's/^/    /' /etc/locale.conf
+  fi
+  refresh_session "LANG=$FALLBACK"
+  note "/etc/locale.gen still has the extra locale enabled; harmless, comment it out to undo"
+  note "log out and back in to finish"
+}
+
+# The 'ara' XKB layout is a plain keymap, no IME needed - but a second layout is
+# useless without a way to reach it. Omarchy's default input.lua adds
+# grp:alts_toggle only when the FIRST layout is non-Latin, so a hand-written
+# kb_layout = "us,ara" silently ends up with no switch key.
+cmd_keyboard() {
+  local write=0 f=${XDG_CONFIG_HOME:-$HOME/.config}/hypr/input.lua
+  [[ ${1:-} == --write ]] && write=1
+
+  cat <<'SNIPPET'
+Add to ~/.config/hypr/input.lua (hl.config deep-merges per key, so naming
+kb_options alone keeps everything else from Omarchy's default):
+
+hl.config({
+  input = {
+    kb_layout = "us,ara",
+    -- Left Alt + Right Alt cycles layouts. kb_options is a replaced string,
+    -- not an appended one, so the Omarchy defaults are repeated here.
+    kb_options = "compose:caps,shift:both_capslock_cancel,grp:alts_toggle",
+  },
+})
+
+Prefer an explicit key instead of Alt+Alt? Drop grp:alts_toggle and bind:
+
+o.bind("SUPER + SHIFT + SPACE", "Cycle keyboard layout",
+  "hyprctl switchxkblayout all next")
+SNIPPET
+
+  (( write )) || { echo; note "printed only; pass --write to patch $f"; return 0; }
+
+  [[ -f $f ]] || die "$f does not exist"
+  # Strip Lua line comments before looking: the shipped input.lua carries a
+  # commented-out grp:alts_toggle example that must not count as configured.
+  if sed 's/--.*//' "$f" | grep -q 'grp:alts_toggle'; then
+    ok "$f already has an active grp:alts_toggle"; return 0
+  fi
+  if (( DRY )); then printf '   would append the snippet to %s\n' "$f"; return 0; fi
+
+  cp -a "$f" "$f.bak.$(date +%Y%m%d-%H%M%S)"
+  cat >> "$f" <<EOF
+
+-- ── keyboard layout toggle (omarchy-lang) ───────────────────────────────────
+-- kb_options is replaced wholesale, so Omarchy's defaults are repeated.
+hl.config({
+  input = {
+    kb_options = "$KB_OPTS_BASE,grp:alts_toggle",
+  },
+})
+EOF
+  ok "appended to $f (backup alongside)"
+  if command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1; then
+    local errs; errs=$(hyprctl configerrors 2>/dev/null)
+    [[ $errs == *"no errors"* || -z $errs ]] && ok "hyprctl reload clean" || { echo "$errs"; die "config errors after reload"; }
+    hyprctl devices | grep -m1 'rules:' | sed 's/^\s*/  /'
+  else
+    note "hyprland not reachable; reload it yourself"
+  fi
+}
+
+# --- argv -------------------------------------------------------------------
+
+CMD=${1:-status}; shift || true
+ARGS=()
+while (( $# )); do
+  case $1 in
+    --mode)        MODE=${2:?--mode needs a value}; shift 2 ;;
+    --mode=*)      MODE=${1#*=}; shift ;;
+    --dry-run|-n)  DRY=1; shift ;;
+    --no-user-env) USER_ENV=0; shift ;;
+    -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    *)             ARGS+=("$1"); shift ;;
+  esac
+done
+
+case $CMD in
+  status)   cmd_status ;;
+  set)      cmd_set "${ARGS[@]}" ;;
+  reset)    cmd_reset ;;
+  keyboard) cmd_keyboard "${ARGS[@]}" ;;
+  -h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
+  *)        die "unknown command: $CMD (status, set, reset, keyboard)" ;;
+esac

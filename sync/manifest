@@ -1,0 +1,12 @@
+# Production paths (relative to $HOME) mirrored into the guest by `./lab sync`.
+# Keep secrets out of this list: everything here lands on a disposable VM.
+.config/hypr
+.config/omarchy/shell.json
+# shell.json references cloned/community plugins by id (e.g. <user>.lock).
+# Without their code the guest shell drops the rest of its plugin graph — the
+# lock IPC target disappears — so the plugin tree ships with it. ~270 MB.
+.config/omarchy/plugins
+.config/omarchy/extensions
+.config/ghostty/config
+.config/tmux/tmux.conf
+.config/herdr/config.toml
