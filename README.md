@@ -117,15 +117,27 @@ promote-backups/        production files replaced by `promote`   (gitignored)
 
 ## Known-red baseline
 
-`./lab test` on a *pristine* guest is not all-green, and that is deliberate —
-the reds are real findings, not lab defects:
+`./lab test` on a *pristine, unsynced* guest is not all-green, and that is
+deliberate — the red is a real finding, not a lab defect:
 
 - `40-dotfiles.sh` fails with
   `clashes with live defaults: {'keys.swap_pane_up': 'prefix+shift+k'}`.
   Omarchy ships `/usr/share/omarchy/config/herdr/config.toml` (md5
   `ea3c7a4726c27ed8ef93e8e527662d07`) as the user's herdr config; its
   `close_workspace = "prefix+shift+k"` collides with herdr's own default
-  `swap_pane_up`. Reproduced on a clean 4.0.2 install, so it is upstream.
-- `50-locale.sh` fails on `kb_layout` whenever the synced host `~/.config/hypr`
-  declares several layouts (e.g. `us,ara`) with no `grp:` switch option and no
-  `switchxkblayout` binding: every layout after the first is unreachable.
+  `swap_pane_up`, which is then unreachable by any chord. Reproduced on a clean
+  4.0.2 install and confirmed by keystroke injection in the guest — the chord
+  destroys the focused workspace and every pane in it, unconfirmed
+  (`confirm_close = false`), and never swaps panes. Filed upstream as
+  [omacom/omarchy#10062](https://github.com/omacom/omarchy/issues/10062).
+  The red disappears after `./lab sync` if the host's own herdr config binds
+  `swap_pane_*` explicitly.
+
+Fixed since, so no longer red:
+
+- `50-locale.sh` used to fail on `kb_layout` when the synced host config
+  declared several layouts (e.g. `us,ara`) with no `grp:` switch option: every
+  layout after the first was unreachable, because Omarchy only appends
+  `grp:alts_toggle` when the *first* layout is non-Latin
+  (`default/hypr/input.lua`). Setting `kb_options` explicitly alongside
+  `kb_layout` fixes it; verified in the guest, then promoted to the host.
