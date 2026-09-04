@@ -37,9 +37,4 @@ for tool in jq python; do
 done
 echo "tools: jq=$(command -v jq) python=$(command -v python)"
 
-# A first-boot Omarchy shows onboarding overlays; suppress them so screenshots
-# show the desktop under test rather than a wizard.
-mkdir -p ~/.local/state/omarchy
-: > ~/.local/state/omarchy/onboarded
-
 echo "postinstall complete"

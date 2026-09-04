@@ -26,7 +26,8 @@ seconds, as often as you like.
 ## Prerequisites
 
 `/dev/kvm` readable and writable by your user, Docker access, ~70 GB free for
-the ISO plus disks, and `openssl`/`jq`/`ssh-keygen` on the host.
+the ISO plus disks, and on the host: `ssh`, `ssh-keygen`, `curl`, `openssl`,
+`jq`, `tar`, `sha256sum`, `timedatectl` — all stock on Arch/Omarchy.
 `./lab doctor` checks all of it.
 
 ## First run
@@ -134,7 +135,7 @@ timestamp — a flight recorder for replaying or auditing a drive. Use
 ## Layout
 
 ```
-lab                     the CLI (bash, no dependencies beyond docker/ssh/jq)
+lab                     the CLI (bash + stock host tools: docker, ssh, curl, openssl, jq, tar)
 lab.conf                cpus, memory, disk size, ports, guest identity
 runner/Dockerfile       arch + qemu-base + edk2-ovmf + cdrtools
 runner/qmp.py           QMP control plane: keys, mouse, shot (bind-mounted, no rebuild)
@@ -153,9 +154,11 @@ promote-backups/        production files replaced by `promote`   (gitignored)
   for GPU performance or Wayland driver behaviour.
 - `state/` holds the guest password and the private lab SSH key. It is
   gitignored; keep it that way.
-- The guest gets NAT networking with only its SSH port forwarded to
-  `127.0.0.1`. Add `state/cidata/tailscale_authkey` before `bootstrap` if you
-  want the guest to join the tailnet instead (the ISO supports it natively).
+- The guest gets NAT networking. Two host ports on `127.0.0.1` reach it: SSH
+  (key-only) and the VNC console, which has no password — anyone with a local
+  account on the host can drive the autologged-in guest through it. Add
+  `state/cidata/tailscale_authkey` before `bootstrap` if you want the guest on
+  the tailnet instead (the ISO supports it natively).
 - `./lab destroy` removes the disks but keeps the ISO and SSH key, so a rebuild
   is one `./lab bootstrap` away.
 
