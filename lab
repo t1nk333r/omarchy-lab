@@ -15,6 +15,7 @@
 #   ./lab keys "<s>"  type into the guest over QMP (works at greeter/lock/TTY)
 #   ./lab mouse x y [button] [n]  move/click the pointer, fractions of the screen
 #   ./lab reset       throw the guest away and recreate it from the snapshot
+#   ./lab sandbox [cmd]  fresh isolated guest, discarded when the session ends
 #   ./lab sync        push production configs into the guest
 #   ./lab test        run the test suite inside the guest
 #   ./lab promote <rel> [...]  copy a guest-verified config back to production
@@ -289,6 +290,7 @@ JSON
   jq -e . "$STATE/cidata/user_credentials.json" >/dev/null || die "generated user_credentials.json is not valid JSON"
 
   runner_once "genisoimage -quiet -output /images/cidata.iso -volid cidata -joliet -rock /state/cidata"
+  private_dirs
   ok "cidata.iso built (user=$LAB_USER host=$LAB_HOSTNAME tz=$tz)"
 }
 
@@ -296,6 +298,9 @@ JSON
 
 qemu_argv() { # qemu_argv <install|run>
   local mode=$1
+  # Isolation is not slirp's job (restrict=on also breaks inbound hostfwd on
+  # QEMU 11.1): the container's network namespace decides what the guest can
+  # reach. hostfwd binds the container's loopback; ssh gets in via docker exec.
   local -a a=(
     qemu-system-x86_64
     -name "$LAB_HOSTNAME"
@@ -304,17 +309,18 @@ qemu_argv() { # qemu_argv <install|run>
     -drive "if=pflash,format=raw,file=/images/OVMF_VARS.fd"
     -drive "if=none,id=hd0,file=/images/disk.qcow2,format=qcow2,cache=writeback,discard=unmap"
     -device virtio-blk-pci,drive=hd0,bootindex=0
-    -netdev "user,id=net0,hostfwd=tcp:0.0.0.0:$LAB_SSH_PORT-:22"
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$LAB_SSH_PORT-:22"
     -device virtio-net-pci,netdev=net0
     -device virtio-vga -device virtio-rng-pci -device virtio-keyboard-pci
     # usb-tablet is the absolute pointer input-send-event drives. virtio-tablet
     # also moves the cursor, but Hyprland's follow_mouse only refocuses on this
     # one — the same device Oligarchy settled on.
     -device qemu-xhci -device usb-tablet
-    -display none -vnc "0.0.0.0:0"
+    -display none
     -qmp "unix:/labrun/qmp.sock,server=on,wait=off"
     -serial "file:/labrun/serial.log"
   )
+  [[ -n $LAB_VNC_PORT ]] && a+=(-vnc "0.0.0.0:0")
   if [[ $mode == install ]]; then
     a+=(
       # q35's AHCI gives one unit per port, so each cdrom needs its own bus.
@@ -327,33 +333,63 @@ qemu_argv() { # qemu_argv <install|run>
   printf '%q ' "${a[@]}"
 }
 
+# Everything the lab writes is private to the invoking user: images/ holds the
+# golden disk (with whatever configs were sealed into it) and cidata.iso (the
+# guest password hash and ssh public key); run/ holds the QMP socket, which is
+# full control of the guest; state/ holds the private key and the password.
+private_dirs() {
+  mkdir -p "$IMAGES" "$RUN" "$SHOTS" "$STATE" "$LAB_DIR/promote-backups"
+  chmod 700 "$IMAGES" "$RUN" "$STATE" "$LAB_DIR/promote-backups"
+  [[ -f $CIDATA ]] && chmod 600 "$CIDATA"
+  return 0
+}
+
 start_vm() { # start_vm <install|run>
   local mode=$1
   vm_running && die "VM already running (./lab down first)"
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
-  mkdir -p "$RUN" "$SHOTS"
+  private_dirs
   : > "$RUN/serial.log"
+  printf '%s\n' "$LAB_NET" > "$RUN/net"
   rm -f "$RUN/pointer.json"   # qmp.py's last-pointer memory: a fresh VM centres the cursor
   [[ -f $OVMF_VARS ]] || runner_once "cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /images/OVMF_VARS.fd"
-  say "starting VM ($mode)"
+  # isolated: no network namespace at all beyond loopback, so the guest can
+  # reach nothing — not the host, not the LAN, not the internet — enforced by
+  # the kernel rather than by qemu. internet: docker's default NAT bridge.
+  local -a net=(--network none)
+  if [[ $LAB_NET == internet ]]; then
+    net=(--network bridge)
+    [[ -n $LAB_VNC_PORT ]] && net+=(-p "127.0.0.1:$LAB_VNC_PORT:5900")
+  elif [[ -n $LAB_VNC_PORT ]]; then
+    die "VNC needs a network namespace to publish on: LAB_NET=internet"
+  fi
+  say "starting VM ($mode, net=$LAB_NET)"
+  # The container is an unprivileged user with no capabilities, no privilege
+  # escalation, a read-only root filesystem, and bounded pids/memory; qemu
+  # needs /dev/kvm, its two bind mounts, and a tmpfs for scratch — nothing else.
   docker run -d --name "$LAB_CONTAINER" "${LAB_UID_ARGS[@]}" \
+    --cap-drop=ALL --security-opt=no-new-privileges \
+    --read-only --tmpfs /tmp:rw,size=64m \
+    --pids-limit=512 --memory="$(( ${LAB_MEMORY%G} + 2 ))g" \
     --device /dev/kvm \
-    -p "127.0.0.1:$LAB_SSH_PORT:$LAB_SSH_PORT" \
-    -p "127.0.0.1:$LAB_VNC_PORT:5900" \
+    "${net[@]}" \
     -v "$IMAGES:/images" -v "$RUN:/labrun" -v "$LAB_DIR/runner:/runner:ro" \
     "$LAB_RUNNER_IMAGE" "$(qemu_argv "$mode")" >/dev/null
   sleep 2
   vm_running || { docker logs "$LAB_CONTAINER" 2>&1 | tail -20; die "VM failed to start"; }
-  ok "VM up (ssh 127.0.0.1:$LAB_SSH_PORT, vnc 127.0.0.1:$LAB_VNC_PORT)"
+  ok "VM up (net=$LAB_NET${LAB_VNC_PORT:+, vnc 127.0.0.1:$LAB_VNC_PORT})"
 }
 
 # The guest's host key changes at every reinstall (installer env -> installed
-# system -> a later bootstrap), and it is a disposable VM reachable only on
-# 127.0.0.1, so host keys are deliberately not pinned.
+# system -> a later bootstrap), and it is a disposable VM reachable only
+# through the container, so host keys are deliberately not pinned.
 # IdentityAgent=none matters: the desktop's ssh-agent stalls ~60s per
 # connection before refusing to list identities, and the lab key is on disk.
+# ProxyCommand: no host port is ever published; ssh rides a docker exec into
+# the container and from there to qemu's loopback hostfwd.
 SSH_OPTS=(
-  -i "$KEY" -p "$LAB_SSH_PORT"
+  -i "$KEY"
+  -o ProxyCommand="docker exec -i $LAB_CONTAINER python /runner/qmp.py proxy $LAB_SSH_PORT"
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
   -o IdentityAgent=none -o IdentitiesOnly=yes -o GSSAPIAuthentication=no
   -o ConnectTimeout=5 -o LogLevel=ERROR
@@ -438,7 +474,7 @@ cmd_golden() {
 }
 
 cmd_up() {
-  [[ -f $DISK ]] || die "no guest disk; run ./lab bootstrap"
+  [[ -f $DISK ]] || die "no guest disk; run ./lab reset (or ./lab bootstrap the first time)"
   start_vm run
   wait_ssh 3
 }
@@ -455,15 +491,40 @@ cmd_down() {
   ok "stopped"
 }
 
-cmd_reset() {
+# Throw the guest's state away and recreate the overlay from golden.
+fresh_overlay() {
   [[ -f $GOLDEN ]] || die "no golden snapshot; run ./lab bootstrap"
-  say "discarding guest state"
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
   rm -f "$DISK"
   cp "$IMAGES/OVMF_VARS.golden.fd" "$OVMF_VARS"
   runner_once "qemu-img create -q -f qcow2 -F qcow2 -b /images/golden.qcow2 /images/disk.qcow2"
+}
+
+cmd_reset() {
+  say "discarding guest state"
+  fresh_overlay
   ok "guest reverted to golden"
   cmd_up
+}
+
+# A throwaway, network-isolated guest for anything untrusted — a community
+# plugin, a script from the internet, an agent you do not want near your
+# machine. Fresh from golden, no network at all (LAB_NET is forced), and the
+# disk is deleted when the session ends, whatever happened inside. With
+# arguments, runs that command in the guest; without, opens a shell.
+cmd_sandbox() {
+  say "sandbox: fresh guest, network isolated, discarded on exit"
+  LAB_NET=isolated
+  fresh_overlay
+  # Discard on every way out — normal exit, ssh failure, Ctrl-C, or a die.
+  trap 'docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1; rm -f "$DISK"; record "sandbox end"' EXIT
+  start_vm run
+  wait_ssh 3
+  record "sandbox start"
+  local status=0
+  cmd_ssh "$@" || status=$?
+  ok "sandbox session over (exit $status); guest discarded, ./lab reset for a normal guest"
+  return $status
 }
 
 cmd_ssh() {
@@ -502,8 +563,9 @@ cmd_status() {
   printf 'container : %s\n' "$(docker inspect -f '{{.State.Status}}' "$LAB_CONTAINER" 2>/dev/null || echo absent)"
   printf 'golden    : %s\n' "$([[ -f $GOLDEN ]] && du -h "$GOLDEN" | cut -f1 || echo none)"
   printf 'overlay   : %s\n' "$([[ -f $DISK ]] && du -h "$DISK" | cut -f1 || echo none)"
-  printf 'ssh       : 127.0.0.1:%s (user %s)\n' "$LAB_SSH_PORT" "$LAB_USER"
-  printf 'vnc       : 127.0.0.1:%s\n' "$LAB_VNC_PORT"
+  printf 'ssh       : via docker exec (no host port), user %s\n' "$LAB_USER"
+  printf 'vnc       : %s\n' "${LAB_VNC_PORT:+127.0.0.1:$LAB_VNC_PORT}${LAB_VNC_PORT:-off (set LAB_VNC_PORT)}"
+  printf 'network   : %s\n' "$(cat "$RUN/net" 2>/dev/null || echo "$LAB_NET (not started)")"
   vm_running && cmd_ssh 'printf "guest     : %s / omarchy %s / %s\n" "$(hostnamectl hostname)" "$(omarchy version 2>/dev/null || echo ?)" "$(uname -r)"' || true
 }
 
@@ -549,21 +611,51 @@ cmd_test() {
 }
 
 # Pull a guest-verified file back to production, keeping a timestamped backup.
+#
+# This is the one place guest-controlled bytes land on the host, so the guest
+# is treated as hostile: the path is checked before anything is fetched, the
+# archive is unpacked into a scratch directory and inspected — nothing but the
+# requested path, no symlinks — and only then copied into place.
+PROMOTE_DENY='^(\.ssh|\.gnupg|\.omp|\.docker|\.aws|\.kube|\.password-store|\.local/share/keyrings|\.config/gh)(/|$)'
 cmd_promote() {
   (( $# )) || die "usage: ./lab promote <path-relative-to-\$HOME> [...]"
   vm_running || die "VM is not running"
-  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  local rel stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  for rel in "$@"; do
+    rel=${rel#./}
+    [[ $rel == /* || $rel == *../* || $rel == ../* || $rel == .. || -z $rel ]] \
+      && die "refusing '$rel': promote takes a path relative to \$HOME with no '..'"
+    [[ $rel =~ $PROMOTE_DENY ]] && die "refusing '$rel': credential store, never promoted from a guest"
+  done
+  local scratch; scratch=$(mktemp -d)
+  # Expanded now: the trap runs at exit, after this local is out of scope.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$scratch'" EXIT
   for rel in "$@"; do
     cmd_ssh "test -e ~/$(printf %q "$rel")" || die "guest has no ~/$rel"
+    rm -rf "${scratch:?}"/*
+    cmd_ssh "tar -C ~ -cf - $(printf %q "$rel")" | tar -C "$scratch" -xf - \
+      || die "could not fetch ~/$rel from the guest"
+    # No symlinks anywhere (a link could redirect the copy below), and every
+    # entry must be the requested path, inside it, or one of its parent dirs.
+    local p
+    while IFS= read -r p; do
+      p=${p#"$scratch"/}
+      [[ -L $scratch/$p ]] && die "refusing '$rel': guest archive contains symlink '$p'"
+      [[ $p == "$rel" || $p == "$rel"/* || $rel == "$p"/* ]] \
+        || die "refusing '$rel': guest archive contains stray '$p'"
+    done < <(find "$scratch" -mindepth 1)
+    [[ -e $scratch/$rel ]] || die "refusing '$rel': archive did not contain it"
     local dst=$HOME/$rel
-    if [[ -e $dst ]]; then
+    if [[ -e $dst || -L $dst ]]; then
       local bak=$LAB_DIR/promote-backups/$stamp/$rel
       mkdir -p "$(dirname "$bak")"
       cp -a "$dst" "$bak"
       echo "  backup: $bak"
     fi
     mkdir -p "$(dirname "$dst")"
-    cmd_ssh "tar -C ~ -cf - $(printf %q "$rel")" | tar -C "$HOME" -xf -
+    rm -rf "$dst"
+    cp -a "$scratch/$rel" "$dst"
     echo "  promoted: $rel"
   done
   ok "promoted $# path(s); backups under promote-backups/$stamp"
@@ -580,6 +672,7 @@ case ${1:-} in
   up)        shift; cmd_up "$@" ;;
   down)      shift; cmd_down "$@" ;;
   reset)     shift; cmd_reset "$@" ;;
+  sandbox)   shift; cmd_sandbox "$@" ;;
   ssh)       shift; cmd_ssh "$@" ;;
   shot)      shift; cmd_shot "$@" ;;
   keys)      shift; cmd_keys "$@" ;;
@@ -590,5 +683,5 @@ case ${1:-} in
   test)      shift; cmd_test "$@" ;;
   promote)   shift; cmd_promote "$@" ;;
   destroy)   shift; cmd_destroy "$@" ;;
-  *) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 1 ;;
+  *) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 1 ;;
 esac

@@ -8,6 +8,7 @@
     qmp.py powerdown
     qmp.py raw   <json-command>
     qmp.py selftest                  key-encoding vectors, no VM needed
+    qmp.py proxy <port>              stdio <-> 127.0.0.1:<port> (ssh ProxyCommand)
 
 Key encoding (ported from ThePrimeagen/Oligarchy src/qemu/keys.ts, which is the
 spec — wire behaviour must match it):
@@ -217,9 +218,39 @@ def selftest():
     print(f"qmp selftest: {len(VECTORS)} vectors + 4 rejections ok")
 
 
+# ssh ProxyCommand target: relays stdin/stdout to a TCP port inside this
+# container's network namespace. With the container on --network none, this is
+# the only way in — qemu's hostfwd listens on the container's loopback, which
+# nothing outside the container can reach.
+def proxy(port):
+    import selectors
+    s = socket.create_connection(("127.0.0.1", port))
+    sel = selectors.DefaultSelector()
+    sel.register(sys.stdin.buffer, selectors.EVENT_READ, "in")
+    sel.register(s, selectors.EVENT_READ, "sock")
+    while True:
+        for key, _ in sel.select():
+            if key.data == "in":
+                data = sys.stdin.buffer.read1(65536)
+                if not data:
+                    s.shutdown(socket.SHUT_WR)
+                    sel.unregister(sys.stdin.buffer)
+                    continue
+                s.sendall(data)
+            else:
+                data = s.recv(65536)
+                if not data:
+                    return
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+
+
 def main(argv):
     if argv[0] == "selftest":
         selftest()
+        return
+    if argv[0] == "proxy":
+        proxy(int(argv[1]))
         return
     f = connect()
     execute(f, "qmp_capabilities")

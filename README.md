@@ -67,13 +67,16 @@ it as the guest user's `authorized_keys` and enables `sshd` for it.
 ./lab keys "<M-ENTER>"    # type into the guest over QMP (see "Driving the guest")
 ./lab mouse 0.25 0.5 left # sweep the pointer there and click
 ./lab reset               # discard the guest, back to golden, in seconds
+./lab sandbox [cmd]       # fresh, network-isolated guest, discarded on exit
 ./lab down                # graceful powerdown
 ./lab provision           # re-apply guest setup (autologin, test tooling)
 ./lab golden              # re-seal the current guest state as the revert point
+LAB_NET=internet ./lab up # give the guest NAT egress (pacman, omarchy update)
 ```
 
-GUI access when you want to click around yourself: a VNC console on
-`127.0.0.1` at `LAB_VNC_PORT` (see `lab.conf`; `./lab status` prints it).
+GUI access when you want to click around yourself: set `LAB_VNC_PORT` in
+`lab.conf` and start with `LAB_NET=internet` — the console is only published
+from a network namespace, and by default there is none.
 
 ## Driving the guest
 
@@ -154,13 +157,73 @@ promote-backups/        production files replaced by `promote`   (gitignored)
   for GPU performance or Wayland driver behaviour.
 - `state/` holds the guest password and the private lab SSH key. It is
   gitignored; keep it that way.
-- The guest gets NAT networking. Two host ports on `127.0.0.1` reach it: SSH
-  (key-only) and the VNC console, which has no password — anyone with a local
-  account on the host can drive the autologged-in guest through it. Add
-  `state/cidata/tailscale_authkey` before `bootstrap` if you want the guest on
-  the tailnet instead (the ISO supports it natively).
+- Networking is off by default. See "Security model" below for what that
+  means and how to opt into egress. Add `state/cidata/tailscale_authkey` before
+  `bootstrap` if you want the guest on the tailnet instead (the ISO supports
+  it natively) — that is a deliberate hole in the isolation.
 - `./lab destroy` removes the disks but keeps the ISO and SSH key, so a rebuild
   is one `./lab bootstrap` away.
+
+## Security model
+
+The guest is treated as hostile. It runs community plugins, synced configs, and
+whatever an agent was told to try, so the question is not "is the guest safe"
+but "what can a compromised guest reach". Measured before any of this existed:
+an unrestricted guest could open TCP connections to the host's own `sshd` and
+syncthing over the docker bridge, to the host's LAN address, and to the
+internet. Each layer below closes one of those.
+
+**Network: none, unless asked.** The VM container runs with `--network none`.
+There is no interface but loopback, no route, no DNS — enforced by the kernel's
+network namespace, not by QEMU (slirp's `restrict=on` was tried and it also
+breaks inbound hostfwd on QEMU 11.1). Nothing is published on the host. SSH
+reaches the guest through `docker exec` into the container and from there to
+qemu's loopback hostfwd (`runner/qmp.py proxy`), so there is no listening
+socket for anyone else on the host to find. `LAB_NET=internet` puts the
+container on docker's NAT bridge for experiments that need packages; that
+re-exposes host services bound on `0.0.0.0` and the LAN, so treat it as a
+conscious step down.
+
+Verified from inside an isolated guest: host `:22` and `:22000` over the
+bridge, the host's LAN IP, the slirp host alias `10.0.2.2`, `1.1.1.1:443`
+and DNS — all blocked. `LAB_NET=internet`: `https://omarchy.org` → 200.
+
+**Container: unprivileged and bounded.** Your uid, `--cap-drop=ALL`,
+`--security-opt=no-new-privileges`, read-only root filesystem with a 64 MB
+tmpfs, `--pids-limit=512`, memory capped at the guest's RAM plus 2 GB. QEMU
+gets `/dev/kvm`, its two bind mounts and the read-only control-plane script,
+nothing else. A QEMU escape lands in a container that can do very little.
+
+**Files: private to you.** `images/` (the golden disk carries whatever configs
+were sealed into it, and `cidata.iso` carries the guest password hash and ssh
+public key), `run/` (the QMP socket is full control of the guest), `state/`
+(private key, password) and `promote-backups/` are all mode 700; `cidata.iso`
+is 600. Every start re-applies this.
+
+**`promote` is the one path from guest to host, and it distrusts the guest.**
+Paths must be `$HOME`-relative with no `..`; credential stores (`.ssh`,
+`.gnupg`, `.omp`, `.docker`, `.aws`, `.kube`, `.password-store`, keyrings,
+`.config/gh`) are refused outright; the archive is unpacked into a scratch
+directory and inspected before anything touches `$HOME` — no symlinks
+anywhere, no entries outside the requested path — and only then copied, after
+the timestamped backup. Verified: `../etc/passwd`, `/etc/passwd`,
+`.ssh/authorized_keys` refused by name; a guest that planted `evil -> /etc`
+inside a directory, or made the requested path itself a symlink, refused by
+inspection; a legitimate file still promotes.
+
+**`sandbox` is the strong form.** `./lab sandbox [cmd]` builds a fresh overlay
+from golden, forces `LAB_NET=isolated`, runs the command (or a shell), and
+deletes the container and the overlay on every exit path — normal, failure,
+Ctrl-C. Use it for anything you would not run on your own machine: a plugin
+from the marketplace, a script from a forum, an agent doing something you did
+not review. Verified: a marker written inside a sandbox does not exist in the
+next `reset` guest.
+
+**What this does not cover.** The docker group is root-equivalent on the host;
+the lab needs it and cannot change that. `LAB_VNC_PORT` publishes an
+unauthenticated console on loopback (internet mode only). `tailscale_authkey`
+in cidata deliberately joins the guest to your tailnet. And `sync` copies your
+real configs into the guest: anything secret inside them is inside the guest.
 
 ## Known-red baseline
 
