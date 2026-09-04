@@ -25,8 +25,9 @@ import time
 
 SOCK = "/labrun/qmp.sock"
 
-# QEMU's keyboard queue holds ~1024 events and drops the rest silently; the
-# guest drains it slowly. 60ms per chord keeps a 1000-char string lossless.
+# Chords are paced: the guest drains input slowly, and virtio-input's small
+# event virtqueue drops events when the guest has no buffer posted. 60ms per
+# chord keeps a 1000-char string lossless (Oligarchy's measured value).
 KEY_CHORD_GAP = 0.06
 # Guest double-click detection needs a gap between press/release pairs.
 MULTI_CLICK_GAP = 0.05

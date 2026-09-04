@@ -4,11 +4,15 @@
 #
 #   ./lab doctor      check prerequisites
 #   ./lab build       build the containerized qemu runner
+#   ./lab fetch-iso   download (or resume) and sha256-verify the Omarchy ISO
+#   ./lab cidata      regenerate the unattended-install answer drive
 #   ./lab bootstrap   unattended-install Omarchy into a fresh disk, then snapshot
+#   ./lab provision   re-apply guest setup (autologin, test tooling)
+#   ./lab golden      re-seal the current guest state as the revert point
 #   ./lab up|down     start/stop the VM
 #   ./lab ssh [cmd]   shell (or one command) in the guest
 #   ./lab shot [name] PNG screenshot of the guest display
-#   ./lab keys "<s>" type into the guest over QMP (works at greeter/lock/TTY)
+#   ./lab keys "<s>"  type into the guest over QMP (works at greeter/lock/TTY)
 #   ./lab mouse x y [button] [n]  move/click the pointer, fractions of the screen
 #   ./lab reset       throw the guest away and recreate it from the snapshot
 #   ./lab sync        push production configs into the guest
@@ -32,7 +36,6 @@ DISK=$IMAGES/disk.qcow2
 CIDATA=$IMAGES/cidata.iso
 OVMF_VARS=$IMAGES/OVMF_VARS.fd
 KEY=$STATE/id_ed25519
-KNOWN=$STATE/known_hosts
 PASSFILE=$STATE/vm_password
 
 die() { printf '\033[31merror\033[0m %s\n' "$*" >&2; exit 1; }
@@ -71,6 +74,13 @@ cmd_doctor() {
   local fail=0
   [[ -c /dev/kvm && -w /dev/kvm ]] && ok "/dev/kvm writable" || { echo "missing /dev/kvm"; fail=1; }
   docker info >/dev/null 2>&1 && ok "docker reachable" || { echo "docker unreachable"; fail=1; }
+  local tool missing=()
+  for tool in ssh ssh-keygen curl openssl jq tar sha256sum timedatectl; do
+    command -v "$tool" >/dev/null || missing+=("$tool")
+  done
+  (( ${#missing[@]} )) && { echo "missing host tools: ${missing[*]}"; fail=1; } || ok "host tools present"
+  local avail; avail=$(df --output=avail -BG "$LAB_DIR" | tail -1 | tr -dc 0-9)
+  (( avail >= 70 )) && ok "${avail}G free" || echo "only ${avail}G free; ISO + disks want ~70G"
   docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 \
     && ok "runner image $LAB_RUNNER_IMAGE" || echo "runner image missing - run: ./lab build"
   if [[ -f $ISO ]]; then
@@ -91,11 +101,17 @@ cmd_build() {
 
 cmd_fetch_iso() {
   mkdir -p "$IMAGES"
-  [[ -f $ISO ]] || { say "downloading $LAB_ISO_URL"; curl -fL --retry 3 -C - -o "$ISO" "$LAB_ISO_URL"; }
-  say "verifying checksum"
   local sums=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso.sha256
   [[ -f $sums ]] || curl -fsSL -o "$sums" "$LAB_ISO_URL.sha256"
-  (cd "$IMAGES" && sha256sum -c "$(basename "$sums")") || die "ISO checksum mismatch"
+  # Gate on the checksum, not the file's existence, so an interrupted download
+  # resumes (-C -) instead of failing the checksum forever.
+  if (cd "$IMAGES" && sha256sum -c --quiet "$(basename "$sums")" 2>/dev/null); then
+    ok "iso verified"; return 0
+  fi
+  say "downloading $LAB_ISO_URL"
+  curl -fL --retry 3 -C - -o "$ISO" "$LAB_ISO_URL"
+  say "verifying checksum"
+  (cd "$IMAGES" && sha256sum -c "$(basename "$sums")") || die "ISO checksum mismatch; delete $ISO and retry"
   ok "iso verified"
 }
 
@@ -118,7 +134,7 @@ cmd_cidata() {
   [[ -n $tz ]] || tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)
 
   local hash
-  hash=$(openssl passwd -6 "$(cat "$PASSFILE")")
+  hash=$(openssl passwd -6 -stdin < "$PASSFILE")   # -stdin: never on argv
 
   # Partition math copied from the ISO configurator so the layout matches a
   # normal install byte for byte (1MiB gap, 2GiB ESP, btrfs remainder).
@@ -336,18 +352,18 @@ start_vm() { # start_vm <install|run>
 # 127.0.0.1, so host keys are deliberately not pinned.
 # IdentityAgent=none matters: the desktop's ssh-agent stalls ~60s per
 # connection before refusing to list identities, and the lab key is on disk.
-ssh_opts() {
-  printf '%s ' -i "$KEY" -p "$LAB_SSH_PORT" \
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o IdentityAgent=none -o IdentitiesOnly=yes -o GSSAPIAuthentication=no \
-    -o ConnectTimeout=5 -o LogLevel=ERROR
-}
+SSH_OPTS=(
+  -i "$KEY" -p "$LAB_SSH_PORT"
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+  -o IdentityAgent=none -o IdentitiesOnly=yes -o GSSAPIAuthentication=no
+  -o ConnectTimeout=5 -o LogLevel=ERROR
+)
 
 wait_ssh() { # wait_ssh <minutes>
   local deadline=$(( $(date +%s) + ${1:-5} * 60 )) n=0
   say "waiting for guest sshd (up to ${1:-5}m)"
   while (( $(date +%s) < deadline )); do
-    if ssh $(ssh_opts) -o BatchMode=yes "$LAB_USER@127.0.0.1" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$LAB_USER@127.0.0.1" true 2>/dev/null; then
       ok "guest reachable over ssh"; return 0
     fi
     vm_running || die "VM died during wait (see ./lab logs)"
@@ -358,10 +374,13 @@ wait_ssh() { # wait_ssh <minutes>
 }
 
 cmd_bootstrap() {
-  docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 || cmd_build
-  [[ -f $ISO ]] || cmd_fetch_iso
-  cmd_cidata
+  # Checked before anything is deleted: start_vm would refuse a running VM, but
+  # only after the disk it is using had been removed from under it.
+  vm_running && die "VM is running; ./lab down first"
   [[ -f $GOLDEN ]] && die "golden snapshot exists; use ./lab reset, or ./lab destroy first"
+  docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 || cmd_build
+  cmd_fetch_iso   # verifies (and resumes) even when the file is already there
+  cmd_cidata
   say "creating $LAB_DISK_SIZE disk"
   rm -f "$DISK" "$OVMF_VARS"
   runner_once "qemu-img create -f qcow2 /images/disk.qcow2 $LAB_DISK_SIZE"
@@ -384,7 +403,16 @@ cmd_provision() {
   cat "$PASSFILE" | cmd_ssh "bash /tmp/postinstall.sh"
   say "restarting display manager"
   printf '%s\n' "$(cat "$PASSFILE")" | cmd_ssh "sudo -S -p '' systemctl restart sddm" || true
-  wait_ssh 2
+  # sshd never went away, so waiting for ssh proves nothing here. What matters
+  # is that the autologin session came up and Omarchy's first-run provisioning
+  # (user units, hooks, welcome toast) finished — otherwise the golden sealed
+  # next would replay first-run on every reset. omarchy-done owns that marker.
+  say "waiting for the first autologin session to finish first-run setup"
+  for _ in $(seq 90); do
+    cmd_ssh 'omarchy-done check first-run-user' 2>/dev/null && { ok "first-run complete"; return 0; }
+    sleep 2
+  done
+  die "guest never completed first-run setup (see ./lab shot)"
 }
 
 # Seal the current guest state as the new revert point. The guest disk is either
@@ -420,6 +448,9 @@ cmd_down() {
   say "shutting guest down"
   qmp powerdown >/dev/null 2>&1 || true
   for _ in $(seq 30); do vm_running || break; sleep 1; done
+  # A forced kill leaves the guest filesystem unclean; say so, since `golden`
+  # may be about to seal it.
+  vm_running && printf '\033[33mwarn\033[0m guest ignored powerdown for 30s; killing it\n'
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
   ok "stopped"
 }
@@ -436,8 +467,8 @@ cmd_reset() {
 }
 
 cmd_ssh() {
-  if (( $# )); then ssh $(ssh_opts) "$LAB_USER@127.0.0.1" "$@"
-  else ssh $(ssh_opts) -t "$LAB_USER@127.0.0.1"; fi
+  if (( $# )); then ssh "${SSH_OPTS[@]}" "$LAB_USER@127.0.0.1" "$@"
+  else ssh "${SSH_OPTS[@]}" -t "$LAB_USER@127.0.0.1"; fi
 }
 
 cmd_shot() {
@@ -497,7 +528,8 @@ cmd_sync() {
   for rel in "${paths[@]}"; do
     local src=$HOME/$rel
     [[ -e $src ]] || { echo "  skip (absent): $rel"; continue; }
-    ssh $(ssh_opts) -n "$LAB_USER@127.0.0.1" "mkdir -p \"\$(dirname ~/$rel)\""
+    # %q so a path with spaces survives the remote shell.
+    ssh "${SSH_OPTS[@]}" -n "$LAB_USER@127.0.0.1" "mkdir -p \"\$(dirname ~/$(printf %q "$rel"))\""
     tar -C "$HOME" -cf - "$rel" | cmd_ssh "tar -C ~ -xf -"
     echo "  synced: $rel"; synced=$((synced+1))
   done
@@ -522,7 +554,7 @@ cmd_promote() {
   vm_running || die "VM is not running"
   local stamp; stamp=$(date +%Y%m%d-%H%M%S)
   for rel in "$@"; do
-    cmd_ssh "test -e ~/$rel" || die "guest has no ~/$rel"
+    cmd_ssh "test -e ~/$(printf %q "$rel")" || die "guest has no ~/$rel"
     local dst=$HOME/$rel
     if [[ -e $dst ]]; then
       local bak=$LAB_DIR/promote-backups/$stamp/$rel
@@ -531,7 +563,7 @@ cmd_promote() {
       echo "  backup: $bak"
     fi
     mkdir -p "$(dirname "$dst")"
-    cmd_ssh "tar -C ~ -cf - $rel" | tar -C "$HOME" -xf -
+    cmd_ssh "tar -C ~ -cf - $(printf %q "$rel")" | tar -C "$HOME" -xf -
     echo "  promoted: $rel"
   done
   ok "promoted $# path(s); backups under promote-backups/$stamp"
@@ -558,5 +590,5 @@ case ${1:-} in
   test)      shift; cmd_test "$@" ;;
   promote)   shift; cmd_promote "$@" ;;
   destroy)   shift; cmd_destroy "$@" ;;
-  *) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
+  *) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 1 ;;
 esac

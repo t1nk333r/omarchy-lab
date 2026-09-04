@@ -21,7 +21,9 @@ manager, and no compiled artifact.
    grows no hypervisor stack. New tooling belongs in `runner/Dockerfile`, which
    is where `qemu`, OVMF and `genisoimage` live. If a command must run on the
    host, it has to be something a stock Arch/Omarchy system already ships
-   (`ssh`, `jq`, `openssl`, `tar`, `docker`).
+   (`docker`, `ssh`, `ssh-keygen`, `curl`, `openssl`, `jq`, `tar`,
+   `sha256sum`, `timedatectl`). `./lab doctor` checks for exactly that list;
+   extend both together.
 2. **No hardcoded identity.** Username, hostname, keyboard, timezone, Omarchy
    version, ports, CPU/memory/disk and image names all come from `lab.conf`,
    which derives host-specific values at runtime (`id -un`,

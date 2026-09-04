@@ -36,7 +36,11 @@ if [[ -f $cfg ]] && command -v herdr >/dev/null; then
   if [[ -s $ref ]] || curl -fsSL "$url" -o "$ref" 2>/dev/null; then
     python - "$cfg" "$ref" <<'PY'
 import json, sys, tomllib, pathlib
-cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+try:
+    cfg = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+except tomllib.TOMLDecodeError as e:
+    print(f"      config.toml is not valid TOML: {e}")
+    sys.exit(1)
 ref = json.loads(pathlib.Path(sys.argv[2]).read_text())
 known = {k["key"]: k for s in ref["sections"] for k in s["keys"]}
 
@@ -61,7 +65,7 @@ live = {k: (d or "").strip('"') for k, d in
         if k not in used and d and d != "unset"}
 clash = {k: d for k, d in live.items() if d in chords}
 bad = {k: v for k, v in used.items()
-       if (a := known[k].get("allowed")) and isinstance(v, str) and v not in a}
+       if (a := known.get(k, {}).get("allowed")) and isinstance(v, str) and v not in a}
 
 problems = []
 if unknown: problems.append(f"unknown keys: {unknown}")

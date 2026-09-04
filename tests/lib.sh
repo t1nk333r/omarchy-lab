@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for lab tests. Sourced by every tests/*.sh, which run inside
 # the guest over ssh — i.e. with no graphical session environment inherited.
 set -uo pipefail
@@ -19,9 +20,13 @@ hypr_env() {
   sig=$(ls -t "$XDG_RUNTIME_DIR"/hypr 2>/dev/null | head -n1) || return 1
   [[ -n ${sig:-} ]] || return 1
   export HYPRLAND_INSTANCE_SIGNATURE=$sig
+  # Any live wayland-N socket (a lab guest has exactly one), skipping the .lock
+  # files that sit beside them.
   local sock
-  sock=$(ls -t "$XDG_RUNTIME_DIR"/wayland-[0-9]* 2>/dev/null | grep -v '\.lock$' | head -n1)
-  [[ -n ${sock:-} ]] && export WAYLAND_DISPLAY=${sock##*/}
+  for sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
+    [[ $sock == *.lock ]] && continue
+    [[ -S $sock ]] && export WAYLAND_DISPLAY=${sock##*/}
+  done
   return 0
 }
 
