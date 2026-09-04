@@ -30,10 +30,13 @@ manager, and no compiled artifact.
    `timedatectl show -p Timezone`, `omarchy version`). Never write a personal
    username, machine name, IP or absolute `/home/<name>` path into tracked
    files.
-3. **Never commit guest or host state.** `images/`, `state/`, `run/` and
-   `promote-backups/` are gitignored. `state/` holds the generated guest
-   password and the lab SSH private key; the repository must stay clonable
-   without secrets.
+3. **Never commit guest or host state, and never commit conversation
+   material.** `images/`, `state/`, `run/` and `promote-backups/` are
+   gitignored; `state/` holds the guest password and the lab SSH private key,
+   and the repository must stay clonable without secrets. Separately: no AI
+   chat transcripts, session exports, agent outputs or tool logs go into this
+   repository, its commit messages, or any issue or PR opened from it. Commits
+   describe the change and its evidence, never the conversation behind it.
 4. **`./lab promote` is the only path from guest to host, and the guest is
    hostile.** It always backs up first, refuses `..`/absolute paths and
    credential stores (`PROMOTE_DENY`), and unpacks into a scratch directory
