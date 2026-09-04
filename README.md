@@ -63,6 +63,8 @@ it as the guest user's `authorized_keys` and enables `sshd` for it.
 ./lab sync                # push production configs (sync/manifest) into guest
 ./lab test                # run tests/ inside the guest
 ./lab shot after-change   # visual proof -> run/shots/after-change.png
+./lab keys "<M-ENTER>"    # type into the guest over QMP (see "Driving the guest")
+./lab mouse 0.25 0.5 left # sweep the pointer there and click
 ./lab reset               # discard the guest, back to golden, in seconds
 ./lab down                # graceful powerdown
 ./lab provision           # re-apply guest setup (autologin, test tooling)
@@ -71,6 +73,47 @@ it as the guest user's `authorized_keys` and enables `sshd` for it.
 
 GUI access when you want to click around yourself: a VNC console on
 `127.0.0.1` at `LAB_VNC_PORT` (see `lab.conf`; `./lab status` prints it).
+
+## Driving the guest
+
+`keys`, `mouse` and `shot` talk to QEMU's QMP socket, so they work wherever
+SSH cannot: the greeter, the lock screen, the installer, a TTY. Together they
+are the loop an agent (or you, blind) runs: **act, wait ~3 s, `shot`, read the
+PNG, decide.** Never type into a screen you have not looked at. This part is
+modelled on [ThePrimeagen/Oligarchy](https://github.com/ThePrimeagen/Oligarchy),
+whose key encoding is ported verbatim (`runner/qmp.py`) and whose field guide
+is worth reading before a long drive.
+
+```bash
+./lab keys 'echo hi<ENTER>'           # letters as written; "A" is shift+a
+./lab keys '<M-ENTER>'                # Super+Enter: Omarchy's terminal binding
+./lab keys '<C-A-F3>'                 # TTY 3 — focus-proof, survives a dead shell
+./lab keys '<Down><Down><ENTER>'      # TUI menus want arrows, not letters
+./lab keys --secret "$pw<ENTER>"      # typed, but the recorder logs only its length
+./lab mouse 0.5 0.5                   # move (a sweep): Hyprland focuses under it
+./lab mouse 0.3 0.2 left 2            # double-click; right, middle, wheel-up/-down too
+```
+
+Encoding: `<ENTER> <ESC> <TAB> <BS> <DEL> <SPACE> <UP> <DOWN> <LEFT> <RIGHT>
+<HOME> <END> <PGUP> <PGDN> <F1>..<F24> <LT> <GT>`; modifiers `<C-x>` ctrl,
+`<A-x>` alt, `<S-x>` shift, `<M-x>` meta, combinable as `<C-S-x>`; a bare
+`<META_L>` taps Super. Mouse coordinates are fractions of the screen
+(`0` top/left, `1` bottom/right): pixel `(px, py)` on a `W×H` shot is
+`x = px / (W - 1)`, `y = py / (H - 1)`.
+
+Two behaviours were measured rather than assumed, and the code says why:
+
+- Key chords go out as one `input-send-event` list (press + release), not
+  `send-key`. Under CPU load the guest's own autorepeat fired between a
+  `send-key` press and its delayed release — `@` arrived as `@@@@@`. Atomic
+  chords typed three 90-character lines identically under eight CPU burners.
+- A pointer move is a 20-step sweep from the last position, not a warp. A
+  single absolute warp moves the cursor but Hyprland 0.56's `follow_mouse`
+  never refocuses on it; the sweep does, every time.
+
+Every `keys`, `mouse` and `shot` is appended to `run/actions.log` with a
+timestamp — a flight recorder for replaying or auditing a drive. Use
+`keys --secret` for anything you would not want in that file.
 
 ## The workflow this exists for
 
@@ -94,11 +137,12 @@ GUI access when you want to click around yourself: a VNC console on
 lab                     the CLI (bash, no dependencies beyond docker/ssh/jq)
 lab.conf                cpus, memory, disk size, ports, guest identity
 runner/Dockerfile       arch + qemu-base + edk2-ovmf + cdrtools
+runner/qmp.py           QMP control plane: keys, mouse, shot (bind-mounted, no rebuild)
 sync/manifest           which production paths `./lab sync` mirrors
 tests/                  checks that run inside the guest
 images/                 ISO, golden.qcow2, overlay, OVMF vars   (gitignored)
 state/                  ssh key, guest password, cidata files    (gitignored)
-run/                    qmp socket, serial log, screenshots      (gitignored)
+run/                    qmp socket, serial log, screenshots, actions.log (gitignored)
 promote-backups/        production files replaced by `promote`   (gitignored)
 ```
 
