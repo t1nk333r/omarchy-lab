@@ -5,3 +5,15 @@ run/
 state/
 promote-backups/
 __pycache__/
+
+# AI session material never belongs in a repository: transcripts, exports,
+# agent outputs, tool logs. Belt and braces for the rule in AGENTS.md.
+.omp/
+.claude/
+.cursor/
+.codex/
+*.jsonl
+*transcript*
+*conversation*
+session-export*
+history/
