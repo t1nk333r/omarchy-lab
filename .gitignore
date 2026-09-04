@@ -4,3 +4,4 @@ images/
 run/
 state/
 promote-backups/
+__pycache__/
