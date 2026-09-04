@@ -34,10 +34,23 @@ manager, and no compiled artifact.
    `promote-backups/` are gitignored. `state/` holds the generated guest
    password and the lab SSH private key; the repository must stay clonable
    without secrets.
-4. **`./lab promote` is the only path from guest to host,** and it always writes
-   a timestamped backup first. Do not add code that writes outside the
-   repository or the guest without that guarantee.
-5. **Keep the CLI single-file and dependency-free.** `lab` is meant to be
+4. **`./lab promote` is the only path from guest to host, and the guest is
+   hostile.** It always backs up first, refuses `..`/absolute paths and
+   credential stores (`PROMOTE_DENY`), and unpacks into a scratch directory
+   that is inspected — no symlinks, nothing outside the requested path —
+   before a byte reaches `$HOME`. Any new guest→host channel gets the same
+   treatment. Do not add code that writes outside the repository or the guest
+   without it.
+5. **The guest has no network unless a human asked for it.** `LAB_NET`
+   defaults to `isolated` (`--network none`: no host, no LAN, no internet, no
+   published ports). Never flip it to `internet` on your own — say what needs
+   egress and let the user decide. `./lab sandbox` forces isolation; use it for
+   anything untrusted.
+6. **Do not weaken the container.** `--cap-drop=ALL`, `no-new-privileges`,
+   read-only rootfs, pids and memory limits are the blast-radius guarantee for
+   a QEMU escape. If qemu genuinely needs something more, add exactly that and
+   say why in the comment beside it.
+7. **Keep the CLI single-file and dependency-free.** `lab` is meant to be
    readable end to end. Prefer a new subcommand there over a new script or a
    framework.
 
