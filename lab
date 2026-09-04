@@ -8,6 +8,8 @@
 #   ./lab up|down     start/stop the VM
 #   ./lab ssh [cmd]   shell (or one command) in the guest
 #   ./lab shot [name] PNG screenshot of the guest display
+#   ./lab keys "<s>" type into the guest over QMP (works at greeter/lock/TTY)
+#   ./lab mouse x y [button] [n]  move/click the pointer, fractions of the screen
 #   ./lab reset       throw the guest away and recreate it from the snapshot
 #   ./lab sync        push production configs into the guest
 #   ./lab test        run the test suite inside the guest
@@ -52,19 +54,16 @@ runner_once() {
 
 vm_running() { [[ $(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER" 2>/dev/null) == true ]]; }
 
-qmp() { # qmp <json-command>
+# Control plane: runner/qmp.py inside the VM container, bind-mounted read-only
+# at /runner so edits take effect without an image rebuild.
+qmp() { # qmp shot|keys|mouse|powerdown|raw ...
   vm_running || die "VM is not running"
-  docker exec -i "$LAB_CONTAINER" python -c '
-import json, socket, sys
-s = socket.socket(socket.AF_UNIX)
-s.connect("/labrun/qmp.sock")
-f = s.makefile("rw")
-f.readline()
-for cmd in ["{\"execute\":\"qmp_capabilities\"}", sys.argv[1]]:
-    f.write(cmd + "\n"); f.flush()
-    print(f.readline().strip())
-' "$1"
+  docker exec -i "$LAB_CONTAINER" python /runner/qmp.py "$@"
 }
+
+# Flight recorder: every key, click and screenshot lands in run/actions.log so
+# a drive can be replayed or audited afterwards.
+record() { printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$RUN/actions.log"; }
 
 # --- prerequisites ----------------------------------------------------------
 
@@ -291,7 +290,11 @@ qemu_argv() { # qemu_argv <install|run>
     -device virtio-blk-pci,drive=hd0,bootindex=0
     -netdev "user,id=net0,hostfwd=tcp:0.0.0.0:$LAB_SSH_PORT-:22"
     -device virtio-net-pci,netdev=net0
-    -device virtio-vga -device virtio-rng-pci -device virtio-tablet-pci -device virtio-keyboard-pci
+    -device virtio-vga -device virtio-rng-pci -device virtio-keyboard-pci
+    # usb-tablet is the absolute pointer input-send-event drives. virtio-tablet
+    # also moves the cursor, but Hyprland's follow_mouse only refocuses on this
+    # one — the same device Oligarchy settled on.
+    -device qemu-xhci -device usb-tablet
     -display none -vnc "0.0.0.0:0"
     -qmp "unix:/labrun/qmp.sock,server=on,wait=off"
     -serial "file:/labrun/serial.log"
@@ -314,13 +317,14 @@ start_vm() { # start_vm <install|run>
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
   mkdir -p "$RUN" "$SHOTS"
   : > "$RUN/serial.log"
+  rm -f "$RUN/pointer.json"   # qmp.py's last-pointer memory: a fresh VM centres the cursor
   [[ -f $OVMF_VARS ]] || runner_once "cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /images/OVMF_VARS.fd"
   say "starting VM ($mode)"
   docker run -d --name "$LAB_CONTAINER" "${LAB_UID_ARGS[@]}" \
     --device /dev/kvm \
     -p "127.0.0.1:$LAB_SSH_PORT:$LAB_SSH_PORT" \
     -p "127.0.0.1:$LAB_VNC_PORT:5900" \
-    -v "$IMAGES:/images" -v "$RUN:/labrun" \
+    -v "$IMAGES:/images" -v "$RUN:/labrun" -v "$LAB_DIR/runner:/runner:ro" \
     "$LAB_RUNNER_IMAGE" "$(qemu_argv "$mode")" >/dev/null
   sleep 2
   vm_running || { docker logs "$LAB_CONTAINER" 2>&1 | tail -20; die "VM failed to start"; }
@@ -414,7 +418,7 @@ cmd_up() {
 cmd_down() {
   vm_running || { ok "already stopped"; return 0; }
   say "shutting guest down"
-  qmp '{"execute":"system_powerdown"}' >/dev/null 2>&1 || true
+  qmp powerdown >/dev/null 2>&1 || true
   for _ in $(seq 30); do vm_running || break; sleep 1; done
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
   ok "stopped"
@@ -439,8 +443,28 @@ cmd_ssh() {
 cmd_shot() {
   local name=${1:-shot-$(date +%Y%m%d-%H%M%S)}
   mkdir -p "$SHOTS"
-  qmp "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"/labrun/shots/$name.png\",\"format\":\"png\"}}" >/dev/null
+  qmp shot "/labrun/shots/$name.png"
+  record "shot $name"
   ok "$SHOTS/$name.png"
+}
+
+# Type into the guest over QMP: works at the greeter, lock screen, installer or
+# a TTY, i.e. wherever ssh cannot. Encoding is documented in runner/qmp.py.
+# --secret keeps the text out of the flight recorder (passwords).
+cmd_keys() {
+  local secret=0
+  [[ ${1:-} == --secret ]] && { secret=1; shift; }
+  (( $# )) || die 'usage: ./lab keys [--secret] "<string>"   e.g. "echo hi<ENTER>", "<M-ENTER>", "<C-A-F3>"'
+  qmp keys "$1"
+  if (( secret )); then record "keys <secret, ${#1} chars>"; else record "keys $1"; fi
+}
+
+# Absolute pointer: x and y are fractions of the screen (0 = top/left, 1 =
+# bottom/right). Omit the button to move only; Hyprland focuses under the pointer.
+cmd_mouse() {
+  (( $# >= 2 )) || die 'usage: ./lab mouse <x> <y> [left|middle|right|wheel-up|wheel-down] [clicks]'
+  qmp mouse "$@"
+  record "mouse $*"
 }
 
 cmd_status() {
@@ -526,11 +550,13 @@ case ${1:-} in
   reset)     shift; cmd_reset "$@" ;;
   ssh)       shift; cmd_ssh "$@" ;;
   shot)      shift; cmd_shot "$@" ;;
+  keys)      shift; cmd_keys "$@" ;;
+  mouse)     shift; cmd_mouse "$@" ;;
   status)    shift; cmd_status "$@" ;;
   logs)      shift; cmd_logs "$@" ;;
   sync)      shift; cmd_sync "$@" ;;
   test)      shift; cmd_test "$@" ;;
   promote)   shift; cmd_promote "$@" ;;
   destroy)   shift; cmd_destroy "$@" ;;
-  *) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
+  *) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
 esac
