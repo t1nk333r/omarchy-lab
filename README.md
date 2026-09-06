@@ -227,7 +227,8 @@ workspace unconfirmed and never swaps panes. Filed as
 red clears after `sync` if the host's herdr config binds `swap_pane_*`
 explicitly.
 
-Resolved, kept for the record: `50-locale.sh` used to flag multi-layout
-`kb_layout` with no `grp:` option — Omarchy only appends `grp:alts_toggle`
-when the *first* layout is non-Latin. Setting `kb_options` alongside
-`kb_layout` fixes it.
+One finding worth knowing about even though the lab no longer tests for it:
+a multi-layout `kb_layout` (e.g. `us,ara`) with no `grp:` option leaves every
+layout after the first unreachable, because Omarchy only appends
+`grp:alts_toggle` when the *first* layout is non-Latin. Setting `kb_options`
+alongside `kb_layout` fixes it.

@@ -68,7 +68,6 @@ manager, and no compiled artifact.
 | `provision/postinstall.sh` | runs in the guest after install, before sealing |
 | `sync/manifest` | host paths (relative to `$HOME`) mirrored into the guest |
 | `tests/` | checks that execute inside the guest; `lib.sh` is shared, not a test |
-| `experiments/` | scratch space for specific investigations |
 
 ## Conventions
 
