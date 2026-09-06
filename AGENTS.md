@@ -88,9 +88,9 @@ manager, and no compiled artifact.
   file and `install`, never a pipe into `tee`.
 - **SSH to the guest must pass `-o IdentityAgent=none`.** A desktop `ssh-agent`
   can stall about 60 seconds per connection before refusing to list identities.
-  `ssh_opts()` already does this; reuse it.
+  The `SSH_OPTS` array in `lab` already does this; reuse it.
 - **`runner/qmp.py` ports Oligarchy's key encoding, and that port is the spec.**
-  `parseKeys` in ThePrimeagen/Oligarchy `src/qemu/keys.ts` defines the wire
+  `parseKeys` in ThePrimeagen/Oligarchy `v1/src/qemu/keys.ts` defines the wire
   behaviour; the 41 vectors in its `keys.test.ts` must keep passing against
   `parse_keys`. The user-facing surface may diverge, the encoding may not.
 - **Chords are one `input-send-event` list, never `send-key`.** `send-key`

@@ -10,7 +10,7 @@
     qmp.py selftest                  key-encoding vectors, no VM needed
     qmp.py proxy <port>              stdio <-> 127.0.0.1:<port> (ssh ProxyCommand)
 
-Key encoding (ported from ThePrimeagen/Oligarchy src/qemu/keys.ts, which is the
+Key encoding (ported from ThePrimeagen/Oligarchy v1/src/qemu/keys.ts, which is the
 spec — wire behaviour must match it):
   - letters type as written; "A" is shift+a, you never add shift yourself
   - special keys in angle brackets: <ENTER> <ESC> <TAB> <BS> <DEL> <SPACE> <UP>

@@ -46,7 +46,9 @@ ok()  { printf '\033[32m ok\033[0m %s\n' "$*"; }
 # --- runner plumbing --------------------------------------------------------
 
 # Containers run as the invoking user so every artifact in images/ and run/
-# stays host-writable; /dev/kvm is mode 0666 here, so no extra groups needed.
+# stays host-writable. --user drops supplementary groups, so /dev/kvm must be
+# writable by the uid itself: Arch's default udev rule makes it 0666. On a
+# 0660 root:kvm host, add --group-add "$(stat -c %g /dev/kvm)" here.
 LAB_UID_ARGS=(--user "$(id -u):$(id -g)")
 
 # One-shot container for image work (qemu-img, genisoimage). No KVM needed.

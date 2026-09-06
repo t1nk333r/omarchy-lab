@@ -30,10 +30,13 @@ fi
 # --- herdr -----------------------------------------------------------------
 cfg=$HOME/.config/herdr/config.toml
 if [[ -f $cfg ]] && command -v herdr >/dev/null; then
-  ref=/tmp/herdr-config-reference.json
+  # The reference ships with the suite (tests/ref/), so this works on the
+  # default isolated guest; the network fetch only covers a herdr version the
+  # lab has not vendored yet.
   ver=$(herdr --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  ref=$(dirname "$0")/ref/herdr-config-reference-$ver.json
   url="https://raw.githubusercontent.com/herdrdev/herdr/v$ver/docs/next/website/src/data/config-reference.json"
-  if [[ -s $ref ]] || curl -fsSL "$url" -o "$ref" 2>/dev/null; then
+  if [[ -s $ref ]] || { ref=/tmp/herdr-config-reference-$ver.json; curl -fsSL "$url" -o "$ref" 2>/dev/null; }; then
     python - "$cfg" "$ref" <<'PY'
 import json, sys, tomllib, pathlib
 try:
