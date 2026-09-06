@@ -58,6 +58,19 @@ runner_once() {
     "$LAB_RUNNER_IMAGE" "$*"
 }
 
+# 60G / 512M / 8g / raw bytes -> bytes. Bare `${LAB_MEMORY%G}` arithmetic
+# accepted only an uppercase suffix and failed on "8g" with bash's unhelpful
+# "value too great for base".
+size_bytes() { # size_bytes <60G|512M|8g|bytes>
+  local s=${1^^}
+  case $s in
+    *G) echo $(( ${s%G} * 1024 * 1024 * 1024 )) ;;
+    *M) echo $(( ${s%M} * 1024 * 1024 )) ;;
+    *[0-9]) echo "$s" ;;
+    *) die "cannot read size '$1' (want e.g. 60G, 512M, or bytes)" ;;
+  esac
+}
+
 vm_running() { [[ $(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER" 2>/dev/null) == true ]]; }
 
 # Control plane: runner/qmp.py inside the VM container, bind-mounted read-only
@@ -141,13 +154,10 @@ cmd_cidata() {
 
   # Partition math copied from the ISO configurator so the layout matches a
   # normal install byte for byte (1MiB gap, 2GiB ESP, btrfs remainder).
-  local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024)) bytes
-  case $LAB_DISK_SIZE in
-    *G) bytes=$(( ${LAB_DISK_SIZE%G} * gib )) ;;
-    *M) bytes=$(( ${LAB_DISK_SIZE%M} * mib )) ;;
-    *)  bytes=$LAB_DISK_SIZE ;;
-  esac
-  local disk_size_in_mib=$(( bytes / mib * mib ))
+  # disk_size_in_mib keeps the configurator's own (misleading) name: it is
+  # bytes rounded down to a whole MiB. Kept so the two can be diffed.
+  local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024))
+  local disk_size_in_mib=$(( $(size_bytes "$LAB_DISK_SIZE") / mib * mib ))
   local boot_start=$mib boot_size=$(( 2 * gib ))
   local main_start=$(( boot_size + boot_start ))
   local main_size=$(( disk_size_in_mib - main_start - mib ))
@@ -372,7 +382,7 @@ start_vm() { # start_vm <install|run>
   docker run -d --name "$LAB_CONTAINER" "${LAB_UID_ARGS[@]}" \
     --cap-drop=ALL --security-opt=no-new-privileges \
     --read-only --tmpfs /tmp:rw,size=64m \
-    --pids-limit=512 --memory="$(( ${LAB_MEMORY%G} + 2 ))g" \
+    --pids-limit=512 --memory="$(( $(size_bytes "$LAB_MEMORY") + 2 * 1024 * 1024 * 1024 ))" \
     --device /dev/kvm \
     "${net[@]}" \
     -v "$IMAGES:/images" -v "$RUN:/labrun" -v "$LAB_DIR/runner:/runner:ro" \
