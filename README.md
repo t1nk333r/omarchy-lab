@@ -1,9 +1,10 @@
-# omarchy-lab
+# t1nk33r-lab
 
-A disposable [Omarchy](https://omarchy.org/) VM you can break, drive, and throw
-away. Test a Hyprland binding, a shell plugin, a locale switch, a lock-screen
-change — anything you would rather not try on your real machine first — then
-revert to a known-good snapshot in about 18 seconds.
+A disposable Linux VM you can break, drive, and throw away. Today it builds
+[Omarchy](https://omarchy.org/) guests — test a Hyprland binding, a shell
+plugin, a locale switch, a lock-screen change, anything you would rather not
+try on your real machine first — then reverts to a known-good snapshot in
+about 18 seconds.
 
 It is built for two operators: you at a terminal, and coding agents. Every
 command is non-interactive, exits with a status, and leaves evidence a machine

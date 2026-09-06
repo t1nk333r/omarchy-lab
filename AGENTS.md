@@ -5,7 +5,7 @@ read [`README.md`](README.md) first; this file assumes it.
 
 ## What this repository is
 
-`omarchy-lab` provisions a disposable [Omarchy](https://omarchy.org/) VM so
+`t1nk33r-lab` provisions a disposable [Omarchy](https://omarchy.org/) VM so
 desktop and system changes can be tested before they are applied to a real
 machine. QEMU runs inside a container with `/dev/kvm` passed through, the
 Omarchy ISO installs itself unattended from a `cidata` answer drive, and the

@@ -140,7 +140,7 @@ cmd_cidata() {
   mkdir -p "$STATE/cidata" "$IMAGES"
   chmod 700 "$STATE"
 
-  [[ -f $KEY ]] || { say "generating lab ssh key"; ssh-keygen -q -t ed25519 -N '' -C "omarchy-lab" -f "$KEY"; }
+  [[ -f $KEY ]] || { say "generating lab ssh key"; ssh-keygen -q -t ed25519 -N '' -C "$LAB_NAME" -f "$KEY"; }
   if [[ ! -f $PASSFILE ]]; then
     say "generating guest password"
     (umask 077; openssl rand -base64 18 > "$PASSFILE")
