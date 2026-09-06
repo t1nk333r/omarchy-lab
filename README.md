@@ -1,10 +1,10 @@
 # t1nk33r-lab
 
-A disposable Linux VM you can break, drive, and throw away. Today it builds
-[Omarchy](https://omarchy.org/) guests — test a Hyprland binding, a shell
-plugin, a locale switch, a lock-screen change, anything you would rather not
-try on your real machine first — then reverts to a known-good snapshot in
-about 18 seconds.
+A disposable Linux VM you can break, drive, and throw away. Point it at
+[Omarchy](https://omarchy.org/) for a full desktop to test a Hyprland binding,
+a shell plugin, a locale switch or a lock screen against — or at Debian or
+Fedora for a headless box that boots in 20 seconds and is deleted afterwards.
+Either way, `reset` returns to a known-good snapshot in seconds.
 
 It is built for two operators: you at a terminal, and coding agents. Every
 command is non-interactive, exits with a status, and leaves evidence a machine
@@ -19,33 +19,64 @@ can read (a PNG, a log line, a test result).
 ./lab promote .config/hypr/input.lua   # copy the verified file home, with a backup
 ```
 
-The guest is the same Omarchy release as the host, installed unattended from
-the official ISO, with the same username, so configs move between the two
-without rewriting. By default it has **no network at all** — see
+## Guests
+
+`LAB_DISTRO` picks what gets built. Two provisioning modes, one seed drive
+(`cidata`, the cloud-init NoCloud label — which is exactly why the Omarchy ISO
+looks for it too):
+
+| `LAB_DISTRO` | Mode | Media | Bootstrap | What you get |
+| --- | --- | --- | --- | --- |
+| `omarchy` (default) | installer | 5.9 GB ISO | ~4.5 min | the full desktop: Hyprland, `omarchy-shell`, autologin, the desktop tests |
+| `debian` | cloud | 324 MB qcow2 | **~19 s** | Debian 13 headless, cloud-init seeded |
+| `fedora` | cloud | ~500 MB qcow2 | **~20 s** | Fedora 44 Cloud headless, same |
+
+In installer mode an ISO plus an answer drive writes a disk, which is then
+sealed as the golden. In cloud mode the official image *is* the golden and the
+guest runs on an overlay grown to `LAB_DISK_SIZE`; cloud-init creates your
+user, plants the lab key and names the host on first boot — offline, from the
+seed drive, with no network at all. The seed stays attached, so `reset` gives a
+blank overlay that seeds itself again.
+
+The Omarchy guest matches the host's release and username, so configs move
+between the two without rewriting. The cloud guests are servers: no Hyprland to
+screenshot, and the desktop tests skip themselves (`SKIP needs omarchy, this
+guest is debian`). They make the better `sandbox`, because throwing one away and
+building another costs 20 seconds.
+
+Every guest is network-isolated by default — see
 [Security model](#security-model).
 
 ## Setup
 
-Requirements: `/dev/kvm` readable and writable by your user, Docker access,
-~70 GB free, and stock host tools (`ssh`, `ssh-keygen`, `curl`, `openssl`,
-`jq`, `tar`, `sha256sum`, `timedatectl`). Nothing gets installed on the host —
-QEMU lives in a container.
+Requirements: `/dev/kvm` readable and writable by your user, Docker access, and
+stock host tools (`ssh`, `ssh-keygen`, `curl`, `openssl`, `jq`, `tar`,
+`sha256sum`, `sha512sum`, `timedatectl`). Nothing gets installed on the host —
+QEMU lives in a container. Disk: ~70 GB for an Omarchy guest, ~25 GB for a
+cloud one.
 
 ```bash
 ./lab doctor        # checks all of the above
 ./lab build         # qemu runner image, ~230 MB
-./lab fetch-iso     # Omarchy ISO, 5.8 GB, sha256-verified, resumable
-./lab bootstrap     # unattended install → autologin → golden snapshot
+./lab bootstrap     # fetch media, seed, install/import, ready
 ```
 
-`bootstrap` boots the ISO with a generated `cidata` answer drive, waits for the
-guest to install itself and reboot, provisions autologin, waits for Omarchy's
-first-run setup to finish, then seals the disk as `images/golden.qcow2`. The
-ISO carries its own packages, so this is offline: ~4.5 minutes on 6 vCPUs.
-Watch it with `./lab logs 60` (serial console) or `./lab shot boot`.
+`bootstrap` does everything, including the download; `./lab fetch-media` and
+`./lab seed` exist to redo either step alone. Downloads are checksum-verified
+against the mirror's own manifest and resume if interrupted. In installer mode
+the guest installs itself offline from the ISO (~4.5 min on 6 vCPUs), gets
+autologin, and waits for Omarchy's first-run setup before the golden is sealed.
+In cloud mode there is no installer at all: import, boot, cloud-init, done in
+about 20 seconds. Watch either with `./lab logs 60` (serial console) or
+`./lab shot boot`.
 
 Credentials land in `state/` (mode 700): a generated guest password and a
-dedicated ssh key the ISO installs as the guest's `authorized_keys`.
+dedicated ssh key, installed as the guest's `authorized_keys` by the ISO or by
+cloud-init.
+
+Running several guests side by side is a copy of the checkout with a different
+`LAB_NAME`, `LAB_DISTRO` and `LAB_SSH_PORT` — that is how the Debian and Fedora
+guests above were verified.
 
 ## Commands
 
@@ -65,7 +96,7 @@ dedicated ssh key the ISO installs as the guest's `authorized_keys`.
 | `logs [n]` | guest serial console |
 | `provision` | re-apply autologin and test tooling (idempotent) |
 | `golden` | seal the current guest state as the new revert point |
-| `cidata` / `fetch-iso` / `build` | regenerate the answer drive / ISO / runner |
+| `seed` / `fetch-media` / `build` | regenerate the answer drive / media / runner |
 | `destroy` | delete disks; keeps ISO and key |
 
 Environment overrides anything in `lab.conf`. The two you will use:
@@ -188,14 +219,17 @@ tailnet. `sync` puts your real configs inside the guest.
   image (`runner/Dockerfile`) carries `qemu`, OVMF and `genisoimage`; `/dev/kvm`
   is passed in, so the guest runs at native speed. Same pattern as Omarchy's
   own `omarchy-windows-vm`.
-- **Unattended install.** The Omarchy ISO looks for a drive labelled `cidata`
-  carrying the configurator's own answer files and skips the wizard. `lab
-  cidata` writes them, mirroring the ISO configurator's `full_disk` template
-  down to the partition arithmetic. Contract:
+- **One seed drive, two mechanisms.** `cidata` is cloud-init's NoCloud label,
+  and the Omarchy ISO looks for the same label — its manual says so. So
+  `lab seed` writes either the configurator's own answer files (mirroring its
+  `full_disk` template down to the partition arithmetic) or cloud-init
+  `user-data`/`meta-data`, onto the same drive. Contract:
   [`manual/51-unattended-installs.md`](https://github.com/omacom/omarchy/blob/quattro/manual/51-unattended-installs.md).
-- **Golden + overlay.** The installed disk becomes `golden.qcow2`; the guest
-  runs on a qcow2 overlay. `reset` deletes the overlay. `golden` commits the
-  overlay into its backing file — never moves it over one.
+- **Golden + overlay.** In installer mode the installed disk becomes
+  `golden.qcow2`; in cloud mode the downloaded image is copied to it directly.
+  Either way the guest runs on a qcow2 overlay, `reset` deletes the overlay,
+  and `golden` commits an overlay into its backing file — never moves it over
+  one.
 - **Host-derived identity.** Username (`id -un`), timezone (`timedatectl`) and
   Omarchy version (`omarchy version`) are read at runtime; `lab.conf` holds
   only tunables.

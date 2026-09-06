@@ -3,6 +3,7 @@
 # so a malformed file degrades the desktop silently — validate it and prove the
 # running shell still answers IPC.
 source "$(dirname "$0")/lib.sh"
+needs_distro omarchy
 
 cfg=$HOME/.config/omarchy/shell.json
 if [[ -f $cfg ]]; then

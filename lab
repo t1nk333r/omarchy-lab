@@ -4,8 +4,8 @@
 #
 #   ./lab doctor      check prerequisites
 #   ./lab build       build the containerized qemu runner
-#   ./lab fetch-iso   download (or resume) and sha256-verify the Omarchy ISO
-#   ./lab cidata      regenerate the unattended-install answer drive
+#   ./lab fetch-media download (or resume) and verify the guest distro's media
+#   ./lab seed        regenerate the unattended answer / cloud-init drive
 #   ./lab bootstrap   unattended-install Omarchy into a fresh disk, then snapshot
 #   ./lab provision   re-apply guest setup (autologin, test tooling)
 #   ./lab golden      re-seal the current guest state as the revert point
@@ -31,10 +31,39 @@ SHOTS=$RUN/shots
 # shellcheck source=lab.conf
 source "$LAB_DIR/lab.conf"
 
-ISO=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso
+# Per-distro facts. Two provisioning modes:
+#   installer   an installer ISO plus an answer drive writes a disk (Omarchy)
+#   cloud       an official cloud image IS the disk; cloud-init seeds it
+# MEDIA is the downloaded artifact, SUMS the checksum file it is verified
+# against, SUMS_ALGO the tool that checks it.
+case $LAB_DISTRO in
+  omarchy)
+    DISTRO_MODE=installer
+    MEDIA=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso
+    MEDIA_URL=$LAB_ISO_URL
+    SUMS_URL=$LAB_ISO_URL.sha256
+    SUMS_ALGO=sha256sum
+    ;;
+  debian)
+    DISTRO_MODE=cloud
+    MEDIA=$IMAGES/debian-$LAB_DEBIAN_RELEASE-genericcloud-amd64.qcow2
+    MEDIA_URL=https://cloud.debian.org/images/cloud/$LAB_DEBIAN_SUITE/latest/$(basename "$MEDIA")
+    SUMS_URL=https://cloud.debian.org/images/cloud/$LAB_DEBIAN_SUITE/latest/SHA512SUMS
+    SUMS_ALGO=sha512sum
+    ;;
+  fedora)
+    DISTRO_MODE=cloud
+    MEDIA=$IMAGES/Fedora-Cloud-Base-Generic-$LAB_FEDORA_RELEASE.x86_64.qcow2
+    MEDIA_URL=https://download.fedoraproject.org/pub/fedora/linux/releases/${LAB_FEDORA_RELEASE%%-*}/Cloud/x86_64/images/$(basename "$MEDIA")
+    SUMS_URL=https://download.fedoraproject.org/pub/fedora/linux/releases/${LAB_FEDORA_RELEASE%%-*}/Cloud/x86_64/images/Fedora-Cloud-$LAB_FEDORA_RELEASE-x86_64-CHECKSUM
+    SUMS_ALGO=sha256sum
+    ;;
+  *) die "unknown LAB_DISTRO '$LAB_DISTRO' (omarchy, debian, fedora)" ;;
+esac
+
 GOLDEN=$IMAGES/golden.qcow2
 DISK=$IMAGES/disk.qcow2
-CIDATA=$IMAGES/cidata.iso
+SEED=$IMAGES/seed.iso
 OVMF_VARS=$IMAGES/OVMF_VARS.fd
 KEY=$STATE/id_ed25519
 PASSFILE=$STATE/vm_password
@@ -99,10 +128,10 @@ cmd_doctor() {
   (( avail >= 70 )) && ok "${avail}G free" || echo "only ${avail}G free; ISO + disks want ~70G"
   docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 \
     && ok "runner image $LAB_RUNNER_IMAGE" || echo "runner image missing - run: ./lab build"
-  if [[ -f $ISO ]]; then
-    ok "iso present ($(du -h "$ISO" | cut -f1))"
+  if [[ -f $MEDIA ]]; then
+    ok "$LAB_DISTRO media present ($(du -h "$MEDIA" | cut -f1))"
   else
-    echo "iso missing - run: ./lab fetch-iso"
+    echo "$LAB_DISTRO media missing - run: ./lab fetch-media"
   fi
   [[ -f $GOLDEN ]] && ok "golden snapshot present" || echo "no golden snapshot - run: ./lab bootstrap"
   vm_running && ok "VM running" || echo "VM stopped"
@@ -115,31 +144,43 @@ cmd_build() {
   ok "runner built"
 }
 
-cmd_fetch_iso() {
+# Download and verify the distro's media. Both checksum styles are handled: a
+# one-line sidecar (Omarchy) and a multi-file manifest listing many artifacts
+# (Debian SHA512SUMS, Fedora CHECKSUM) — from those, only our file's line is
+# checked, so the rest of the mirror's contents are irrelevant.
+cmd_fetch_media() {
   mkdir -p "$IMAGES"
-  local sums=$IMAGES/omarchy-$LAB_OMARCHY_VERSION.iso.sha256
-  [[ -f $sums ]] || curl -fsSL -o "$sums" "$LAB_ISO_URL.sha256"
+  local base; base=$(basename "$MEDIA")
+  local sums=$IMAGES/$base.sums
+  [[ -s $sums ]] || curl -fsSL "$SUMS_URL" | grep -F "$base" | grep -vE '^#' > "$sums"
+  [[ -s $sums ]] || die "no checksum line for $base in $SUMS_URL"
+  # Fedora's CHECKSUM is BSD-style: "SHA256 (file) = hash". Normalise it.
+  if grep -qE '^[A-Z0-9]+ \(' "$sums"; then
+    sed -i -E 's/^[A-Z0-9]+ \((.*)\) = (.*)$/\2  \1/' "$sums"
+  fi
   # Gate on the checksum, not the file's existence, so an interrupted download
   # resumes (-C -) instead of failing the checksum forever.
-  if (cd "$IMAGES" && sha256sum -c --quiet "$(basename "$sums")" 2>/dev/null); then
-    ok "iso verified"; return 0
+  if (cd "$IMAGES" && $SUMS_ALGO -c --quiet "$(basename "$sums")" 2>/dev/null); then
+    ok "$LAB_DISTRO media verified"; return 0
   fi
-  say "downloading $LAB_ISO_URL"
-  curl -fL --retry 3 -C - -o "$ISO" "$LAB_ISO_URL"
-  say "verifying checksum"
-  (cd "$IMAGES" && sha256sum -c "$(basename "$sums")") || die "ISO checksum mismatch; delete $ISO and retry"
-  ok "iso verified"
+  say "downloading $MEDIA_URL"
+  curl -fL --retry 3 -C - -o "$MEDIA" "$MEDIA_URL"
+  say "verifying checksum ($SUMS_ALGO)"
+  (cd "$IMAGES" && $SUMS_ALGO -c "$(basename "$sums")") \
+    || die "checksum mismatch; delete $MEDIA and retry"
+  ok "$LAB_DISTRO media verified"
 }
 
-# --- cidata (unattended answer drive) ---------------------------------------
+# --- seed drive (unattended answers) ---------------------------------------
 
-# Builds the drive the Omarchy ISO looks for: label cidata, carrying exactly the
-# files the interactive configurator would have written.
+# Both modes use a drive labelled `cidata`: it is the cloud-init NoCloud label,
+# which is exactly why the Omarchy ISO looks for it too. Only the payload
+# differs — the ISO configurator's JSON, or cloud-init's user-data/meta-data.
 # Contract: omacom/omarchy manual/51-unattended-installs.md
-cmd_cidata() {
+cmd_seed() {
   mkdir -p "$STATE/cidata" "$IMAGES"
   chmod 700 "$STATE"
-
+  rm -f "$STATE"/cidata/*
   [[ -f $KEY ]] || { say "generating lab ssh key"; ssh-keygen -q -t ed25519 -N '' -C "$LAB_NAME" -f "$KEY"; }
   if [[ ! -f $PASSFILE ]]; then
     say "generating guest password"
@@ -151,6 +192,35 @@ cmd_cidata() {
 
   local hash
   hash=$(openssl passwd -6 -stdin < "$PASSFILE")   # -stdin: never on argv
+
+  if [[ $DISTRO_MODE == cloud ]]; then
+    # cloud-init NoCloud: the image is already installed, so this only creates
+    # the user, plants the key and names the host. instance-id changes with the
+    # key so a regenerated seed is treated as a new instance.
+    cat > "$STATE/cidata/meta-data" <<YAML
+instance-id: $LAB_NAME-$(cksum < "$KEY.pub" | cut -d' ' -f1)
+local-hostname: $LAB_HOSTNAME
+YAML
+    cat > "$STATE/cidata/user-data" <<YAML
+#cloud-config
+hostname: $LAB_HOSTNAME
+timezone: $tz
+users:
+  - name: $LAB_USER
+    groups: [sudo, wheel]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: $hash
+    sudo: ["ALL=(ALL) ALL"]
+    ssh_authorized_keys:
+      - $(cat "$KEY.pub")
+ssh_pwauth: false
+YAML
+    runner_once "genisoimage -quiet -output /images/$(basename "$SEED") -volid cidata -joliet -rock /state/cidata"
+    private_dirs
+    ok "seed.iso built for $LAB_DISTRO (user=$LAB_USER host=$LAB_HOSTNAME tz=$tz)"
+    return 0
+  fi
 
   # Partition math copied from the ISO configurator so the layout matches a
   # normal install byte for byte (1MiB gap, 2GiB ESP, btrfs remainder).
@@ -301,9 +371,9 @@ JSON
   jq -e . "$STATE/cidata/user_configuration.json" >/dev/null || die "generated user_configuration.json is not valid JSON"
   jq -e . "$STATE/cidata/user_credentials.json" >/dev/null || die "generated user_credentials.json is not valid JSON"
 
-  runner_once "genisoimage -quiet -output /images/cidata.iso -volid cidata -joliet -rock /state/cidata"
+  runner_once "genisoimage -quiet -output /images/$(basename "$SEED") -volid cidata -joliet -rock /state/cidata"
   private_dirs
-  ok "cidata.iso built (user=$LAB_USER host=$LAB_HOSTNAME tz=$tz)"
+  ok "seed.iso built for $LAB_DISTRO (user=$LAB_USER host=$LAB_HOSTNAME tz=$tz)"
 }
 
 # --- VM lifecycle -----------------------------------------------------------
@@ -333,12 +403,19 @@ qemu_argv() { # qemu_argv <install|run>
     -serial "file:/labrun/serial.log"
   )
   [[ -n $LAB_VNC_PORT ]] && a+=(-vnc "0.0.0.0:0")
+  # q35's AHCI gives one unit per port, so each cdrom needs its own bus.
   if [[ $mode == install ]]; then
     a+=(
-      # q35's AHCI gives one unit per port, so each cdrom needs its own bus.
-      -drive "if=none,id=cd0,file=/images/$(basename "$ISO"),format=raw,media=cdrom"
+      -drive "if=none,id=cd0,file=/images/$(basename "$MEDIA"),format=raw,media=cdrom"
       -device ide-cd,drive=cd0,bus=ide.0,bootindex=1
-      -drive "if=none,id=cd1,file=/images/cidata.iso,format=raw,media=cdrom"
+      -drive "if=none,id=cd1,file=/images/$(basename "$SEED"),format=raw,media=cdrom"
+      -device ide-cd,drive=cd1,bus=ide.1
+    )
+  elif [[ $DISTRO_MODE == cloud ]]; then
+    # The seed stays attached for the guest's whole life: a `reset` gives a
+    # blank overlay with no cloud-init state, so first-boot has to run again.
+    a+=(
+      -drive "if=none,id=cd1,file=/images/$(basename "$SEED"),format=raw,media=cdrom"
       -device ide-cd,drive=cd1,bus=ide.1
     )
   fi
@@ -346,13 +423,13 @@ qemu_argv() { # qemu_argv <install|run>
 }
 
 # Everything the lab writes is private to the invoking user: images/ holds the
-# golden disk (with whatever configs were sealed into it) and cidata.iso (the
-# guest password hash and ssh public key); run/ holds the QMP socket, which is
-# full control of the guest; state/ holds the private key and the password.
+# golden disk (with whatever configs were sealed into it) and the seed drive
+# (the guest password hash and ssh public key); run/ holds the QMP socket,
+# which is full control of the guest; state/ holds the private key and password.
 private_dirs() {
   mkdir -p "$IMAGES" "$RUN" "$SHOTS" "$STATE" "$LAB_DIR/promote-backups"
   chmod 700 "$IMAGES" "$RUN" "$STATE" "$LAB_DIR/promote-backups"
-  [[ -f $CIDATA ]] && chmod 600 "$CIDATA"
+  [[ -f $SEED ]] && chmod 600 "$SEED"
   return 0
 }
 
@@ -427,10 +504,25 @@ cmd_bootstrap() {
   vm_running && die "VM is running; ./lab down first"
   [[ -f $GOLDEN ]] && die "golden snapshot exists; use ./lab reset, or ./lab destroy first"
   docker image inspect "$LAB_RUNNER_IMAGE" >/dev/null 2>&1 || cmd_build
-  cmd_fetch_iso   # verifies (and resumes) even when the file is already there
-  cmd_cidata
-  say "creating $LAB_DISK_SIZE disk"
+  cmd_fetch_media   # verifies (and resumes) even when the file is already there
+  cmd_seed
   rm -f "$DISK" "$OVMF_VARS"
+  if [[ $DISTRO_MODE == cloud ]]; then
+    # No installer: the downloaded cloud image IS the golden, and the guest
+    # runs on an overlay grown to LAB_DISK_SIZE (cloud-init's growpart takes
+    # the filesystem the rest of the way on first boot).
+    say "importing $(basename "$MEDIA") as the golden image"
+    cp --reflink=auto "$MEDIA" "$GOLDEN"
+    runner_once "qemu-img create -q -f qcow2 -F qcow2 -b /images/golden.qcow2 /images/disk.qcow2 $LAB_DISK_SIZE"
+    runner_once "cp /usr/share/edk2/x64/OVMF_VARS.4m.fd /images/OVMF_VARS.fd"
+    cp "$OVMF_VARS" "$IMAGES/OVMF_VARS.golden.fd"
+    start_vm run
+    say "cloud-init is seeding the guest on its first boot"
+    wait_ssh 5
+    ok "$LAB_DISTRO guest ready; ./lab reset returns to this image in seconds"
+    return 0
+  fi
+  say "creating $LAB_DISK_SIZE disk"
   runner_once "qemu-img create -f qcow2 /images/disk.qcow2 $LAB_DISK_SIZE"
   start_vm install
   say "unattended install running; the guest reboots itself when done"
@@ -440,8 +532,10 @@ cmd_bootstrap() {
 }
 
 # Post-install guest setup: autologin so a reset guest lands in Hyprland, plus
-# the tooling the test suite needs. Idempotent.
+# the tooling the test suite needs. Omarchy-only and idempotent; the cloud
+# images have no display manager and cloud-init has already done the rest.
 cmd_provision() {
+  [[ $LAB_DISTRO == omarchy ]] || { ok "nothing to provision on $LAB_DISTRO"; return 0; }
   vm_running || die "VM is not running"
   say "provisioning guest"
   [[ -f $PASSFILE ]] || die "missing $PASSFILE"
@@ -578,14 +672,17 @@ cmd_status() {
   printf 'ssh       : via docker exec (no host port), user %s\n' "$LAB_USER"
   printf 'vnc       : %s\n' "${LAB_VNC_PORT:+127.0.0.1:$LAB_VNC_PORT}${LAB_VNC_PORT:-off (set LAB_VNC_PORT)}"
   printf 'network   : %s\n' "$(cat "$RUN/net" 2>/dev/null || echo "$LAB_NET (not started)")"
-  vm_running && cmd_ssh 'printf "guest     : %s / omarchy %s / %s\n" "$(hostnamectl hostname)" "$(omarchy version 2>/dev/null || echo ?)" "$(uname -r)"' || true
+  printf 'distro    : %s (%s mode)\n' "$LAB_DISTRO" "$DISTRO_MODE"
+  # PRETTY_NAME covers every distro; omarchy's own version is worth the extra
+  # word on the guests that have it.
+  vm_running && cmd_ssh 'printf "guest     : %s / %s%s / %s\n" "$(hostnamectl hostname)" "$(. /etc/os-release; echo "$PRETTY_NAME")" "$(command -v omarchy >/dev/null && printf " (omarchy %s)" "$(omarchy version)")" "$(uname -r)"' || true
 }
 
 cmd_logs() { tail -n "${1:-40}" "$RUN/serial.log" 2>/dev/null || echo "no serial log yet"; }
 
 cmd_destroy() {
   docker rm -f "$LAB_CONTAINER" >/dev/null 2>&1 || true
-  rm -f "$DISK" "$GOLDEN" "$OVMF_VARS" "$IMAGES/OVMF_VARS.golden.fd" "$CIDATA"
+  rm -f "$DISK" "$GOLDEN" "$OVMF_VARS" "$IMAGES/OVMF_VARS.golden.fd" "$SEED"
   ok "guest disks removed (ISO and ssh key kept)"
 }
 
@@ -616,10 +713,16 @@ cmd_test() {
   tar -C "$LAB_DIR" -cf - tests | cmd_ssh "rm -rf ~/lab-tests && mkdir -p ~/lab-tests && tar -C ~/lab-tests -xf -"
   say "running tests in guest"
   # [0-9]*.sh so tests/lib.sh (sourced infrastructure) is not run as a test.
-  cmd_ssh 'set -o pipefail; fail=0; for t in ~/lab-tests/tests/[0-9]*.sh; do
-      printf "\n--- %s\n" "$(basename "$t")"
-      bash "$t" || { fail=1; printf "FAILED: %s\n" "$(basename "$t")"; }
-    done; exit $fail'
+  # LAB_DISTRO travels with it: tests that need a desktop skip themselves.
+  cmd_ssh "LAB_DISTRO=$LAB_DISTRO bash -s" <<'REMOTE'
+set -o pipefail
+fail=0
+for t in ~/lab-tests/tests/[0-9]*.sh; do
+  printf "\n--- %s\n" "$(basename "$t")"
+  bash "$t" || { fail=1; printf "FAILED: %s\n" "$(basename "$t")"; }
+done
+exit $fail
+REMOTE
 }
 
 # Pull a guest-verified file back to production, keeping a timestamped backup.
@@ -676,8 +779,8 @@ cmd_promote() {
 case ${1:-} in
   doctor)    shift; cmd_doctor "$@" ;;
   build)     shift; cmd_build "$@" ;;
-  fetch-iso) shift; cmd_fetch_iso "$@" ;;
-  cidata)    shift; cmd_cidata "$@" ;;
+  fetch-media) shift; cmd_fetch_media "$@" ;;
+  seed)      shift; cmd_seed "$@" ;;
   bootstrap) shift; cmd_bootstrap "$@" ;;
   golden)    shift; cmd_golden "$@" ;;
   provision) shift; cmd_provision "$@" ;;

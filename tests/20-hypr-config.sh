@@ -3,6 +3,7 @@
 # error report. This is the test that catches a bad binding or rule before it
 # reaches production.
 source "$(dirname "$0")/lib.sh"
+needs_distro omarchy
 
 hypr_env || { fail "no hyprland instance"; finish; }
 

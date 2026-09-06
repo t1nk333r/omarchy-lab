@@ -2,6 +2,7 @@
 # The guest is a real Omarchy desktop, not just an Arch box: assert the pieces
 # every later test depends on are actually running.
 source "$(dirname "$0")/lib.sh"
+needs_distro omarchy
 
 command -v omarchy >/dev/null && pass "omarchy cli present ($(omarchy version 2>/dev/null))" \
   || fail "omarchy cli missing"

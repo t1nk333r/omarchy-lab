@@ -10,6 +10,15 @@ FAILED=0
 
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 
+# Distro gate. The lab can boot Omarchy (a full desktop) or a headless cloud
+# image; a test that needs Hyprland says so and skips itself elsewhere.
+LAB_DISTRO=${LAB_DISTRO:-omarchy}
+needs_distro() { # needs_distro omarchy
+  for d in "$@"; do [[ $LAB_DISTRO == "$d" ]] && return 0; done
+  printf '  SKIP needs %s, this guest is %s\n' "$*" "$LAB_DISTRO"
+  exit 0
+}
+
 # omarchy-shell refuses to run without OMARCHY_PATH, which the graphical
 # session exports but an ssh session does not inherit.
 export OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}

@@ -5,12 +5,23 @@ read [`README.md`](README.md) first; this file assumes it.
 
 ## What this repository is
 
-`t1nk33r-lab` provisions a disposable [Omarchy](https://omarchy.org/) VM so
-desktop and system changes can be tested before they are applied to a real
-machine. QEMU runs inside a container with `/dev/kvm` passed through, the
-Omarchy ISO installs itself unattended from a `cidata` answer drive, and the
-installed disk is sealed as a golden snapshot that the guest overlays. Reverting
-the guest costs seconds.
+`t1nk33r-lab` provisions a disposable VM so system and desktop changes can be
+tested before they are applied to a real machine. QEMU runs inside a container
+with `/dev/kvm` passed through, and the guest runs on a qcow2 overlay over a
+golden image, so reverting costs seconds.
+
+`LAB_DISTRO` selects the guest and with it the provisioning mode:
+
+- `omarchy` — **installer mode**: the Omarchy ISO installs itself unattended
+  from a `cidata` answer drive, then the disk is sealed as the golden. This is
+  the only guest with a desktop, and the only one `provision` and the
+  Hyprland/`omarchy-shell` tests apply to.
+- `debian`, `fedora` — **cloud mode**: the distro's official cloud image *is*
+  the golden, and cloud-init seeds it from the same `cidata` drive on first
+  boot. Headless, ~20 s to a usable guest.
+
+`cidata` is cloud-init's NoCloud label; the Omarchy ISO deliberately reuses it,
+which is what lets one seed builder serve both modes.
 
 Everything is POSIX-ish bash plus Docker. There is no build step, no package
 manager, and no compiled artifact.
@@ -68,9 +79,21 @@ manager, and no compiled artifact.
 | `provision/postinstall.sh` | runs in the guest after install, before sealing |
 | `sync/manifest` | host paths (relative to `$HOME`) mirrored into the guest |
 | `tests/` | checks that execute inside the guest; `lib.sh` is shared, not a test |
+| `tests/ref/` | vendored reference data, so tests do not need the network |
 
 ## Conventions
 
+- **A test that needs a desktop must say so.** Call `needs_distro omarchy`
+  right after sourcing `lib.sh`; it prints a SKIP and exits 0 elsewhere. A test
+  with no gate has to pass on a headless Debian/Fedora guest too — `05-boot.sh`
+  is the model.
+- **Tests must not need the network.** The guest is isolated by default, so
+  reference data is vendored under `tests/ref/` and a fetch is a fallback only.
+- **A new distro is a `case` branch, not a plugin.** Add it to the `case
+  $LAB_DISTRO` block near the top of `lab` (mode, media, URL, checksum file and
+  algorithm) and, if it is cloud mode, nothing else — `cmd_seed`, `bootstrap`,
+  `reset` and `sandbox` are already mode-driven. Verify by bootstrapping it in
+  a copy of the checkout with its own `LAB_NAME` and `LAB_SSH_PORT`.
 - **Subcommands** are `cmd_<name>()` in `lab`, registered in the `case` block at
   the end. Keep the usage header comment at the top of the file in sync.
 - **Config** is read with `: "${LAB_FOO:=default}"` so environment variables

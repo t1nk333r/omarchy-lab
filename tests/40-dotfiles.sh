@@ -3,6 +3,7 @@
 # is deliberately not trusted here: it accepts unknown keys and bogus chords,
 # so herdr's canonical key reference is used instead when it is reachable.
 source "$(dirname "$0")/lib.sh"
+needs_distro omarchy
 
 # --- ghostty ---------------------------------------------------------------
 if command -v ghostty >/dev/null && [[ -f $HOME/.config/ghostty/config ]]; then
